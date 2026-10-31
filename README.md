@@ -161,6 +161,9 @@ every key with its default.
 | `whisper_key` | `LeftAlt` | hold to whisper: half radius |
 | `distance_scale` | `1.0` | scale the audible radius, 0.1..4 |
 | `agc` | `on` | even out the microphone level |
+| `record` | `off` | write every speaker to a WAV file |
+| `record_dir` | `svc_voice-recordings` | where those files go |
+| `volume.<name>` | `1.0` | per-player volume, 0..2 |
 | `occlusion` | `on` | muffle voices behind walls |
 
 A bad value never takes the rest of the file with it: it is ignored and the default stands. The

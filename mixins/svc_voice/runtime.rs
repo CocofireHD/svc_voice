@@ -87,6 +87,8 @@ pub fn entity_position(key: &[u8; 16]) -> Option<[f64; 3]> {
 // The server's group list and the group this client is in (§8.5, §8.10).
 static GROUPS: Mutex<Option<svc_engine::protocol::groups::Groups>> = Mutex::new(None);
 static GROUP_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// UUID -> player name, from the player list; the settings file talks in names.
+static PLAYER_NAMES: Mutex<Option<HashMap<[u8; 16], String>>> = Mutex::new(None);
 // A join typed before the server had sent its group list: the tick retries it
 // as soon as the name shows up, instead of making the player type it again.
 static PENDING_JOIN: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
@@ -132,6 +134,42 @@ pub fn current_group() -> Option<svc_engine::protocol::groups::GroupInfo> {
 /// `0x03` frames the session has seen, played or not.
 pub fn group_packets_seen() -> u64 {
     GROUP_PACKETS.load(Ordering::Relaxed)
+}
+
+/// Remember a name from the player list (`PlayerInfoUpdate`).
+pub fn set_player_name(key: [u8; 16], name: &str) {
+    PLAYER_NAMES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, name.to_ascii_lowercase());
+}
+
+/// The per-speaker gains the settings ask for, keyed by the UUID the voice
+/// packets carry.
+fn player_gains() -> HashMap<svc_engine::protocol::Uuid, f32> {
+    let cfg = config();
+    if cfg.player_volume.is_empty() {
+        return HashMap::new();
+    }
+    let names = PLAYER_NAMES.lock().unwrap();
+    let Some(names) = names.as_ref() else {
+        return HashMap::new();
+    };
+    let mut gains = HashMap::new();
+    for (key, name) in names {
+        if let Some(v) = cfg.player_volume.get(name) {
+            gains.insert(uuid_from_key(key), *v);
+        }
+    }
+    gains
+}
+
+/// The 16 bytes back into the protocol UUID the engine compares against.
+fn uuid_from_key(key: &[u8; 16]) -> svc_engine::protocol::Uuid {
+    let msb = i64::from_be_bytes(key[0..8].try_into().unwrap());
+    let lsb = i64::from_be_bytes(key[8..16].try_into().unwrap());
+    svc_engine::protocol::Uuid::from_parts(msb, lsb)
 }
 
 pub fn set_whisper(on: bool) {
@@ -240,6 +278,10 @@ pub struct Config {
     pub occlusion: bool,
     pub distance_scale: f32,
     pub agc: bool,
+    pub record: bool,
+    pub record_dir: String,
+    /// `volume.<name> = 0.5`, keyed lowercase.
+    pub player_volume: std::collections::HashMap<String, f32>,
 }
 
 impl Default for Config {
@@ -258,6 +300,9 @@ impl Default for Config {
             occlusion: true,
             distance_scale: 1.0,
             agc: true,
+            record: false,
+            record_dir: "svc_voice-recordings".into(),
+            player_volume: std::collections::HashMap::new(),
         }
     }
 }
@@ -308,6 +353,13 @@ impl Config {
                         }
                     }
                 }
+                "record" => {
+                    cfg.record = !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "0"
+                    )
+                }
+                "record_dir" if !value.is_empty() => cfg.record_dir = value.to_string(),
                 "agc" => {
                     cfg.agc = !matches!(
                         value.to_ascii_lowercase().as_str(),
@@ -320,7 +372,16 @@ impl Config {
                         "off" | "false" | "no" | "0"
                     )
                 }
-                _ => {}
+                other => {
+                    // volume.<player> = 0.5 — one line per player, no section.
+                    if let Some(name) = other.strip_prefix("volume.") {
+                        if let Ok(v) = value.parse::<f32>() {
+                            if (0.0..=2.0).contains(&v) && !name.is_empty() {
+                                cfg.player_volume.insert(name.to_string(), v);
+                            }
+                        }
+                    }
+                }
             }
         }
         cfg
@@ -682,12 +743,22 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                 pipe.set_volume(cfg.volume);
                 pipe.set_distance_scale(cfg.distance_scale);
                 pipe.set_agc(cfg.agc);
+                if cfg.record {
+                    match pipe.start_recording(&cfg.record_dir) {
+                        Ok(()) => log::info!(
+                            "svc_voice: recording every speaker into {}",
+                            cfg.record_dir
+                        ),
+                        Err(e) => log::warn!("svc_voice: cannot record into {}: {e}", cfg.record_dir),
+                    }
+                }
                 while !STOP.load(Ordering::SeqCst) {
                     // The pipeline does not read the socket: the caller pumps,
                     // which is also what drives the session's timers.
                     pipe.set_gate(gate_mode());
                     pipe.set_ptt(ptt_held());
                     pipe.set_whisper(whispering());
+                    pipe.set_player_gains(player_gains());
                     if mic_test_active() {
                         // Local monitoring: microphone straight to the speakers.
                         pipe.loopback(&mut mic, &sink);
@@ -711,7 +782,7 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     let s = client.stats();
                     GROUP_PACKETS.store(s.group_sound_frames, Ordering::Relaxed);
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} occ {} grp {} g03 {} groups {} pos {} gate {} {}",
+                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} occ {} grp {} g03 {} groups {} rec {} pos {} gate {} {}",
                         s.auth_sent,
                         s.connection_check_sent,
                         s.mic_frames_sent,
@@ -724,6 +795,7 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         pipe.group_frames(),
                         group_packets_seen(),
                         known_groups(),
+                        pipe.recorded_tracks(),
                         known_speakers(),
                         gate_name_now(),
                         if ptt_held() { "ptt" } else { "" }

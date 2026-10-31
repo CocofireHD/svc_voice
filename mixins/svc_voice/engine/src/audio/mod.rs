@@ -23,8 +23,10 @@
 
 #[cfg(feature = "device")]
 mod device;
+pub mod record;
 #[cfg(feature = "device")]
 pub use device::{Capture, FrameAssembler, Playback};
+pub use record::Recorder;
 
 use crate::opus::{Application, OpusDecoder, OpusEncoder};
 

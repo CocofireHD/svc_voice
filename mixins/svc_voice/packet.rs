@@ -14,6 +14,14 @@ fn svc_voice_packet(
         }
         // §7.4: the speaker's position comes from the entity, keyed by the UUID
         // the voice packet carries. `AddEntity` is where the two meet.
+        // The settings file names players, the voice packets carry UUIDs.
+        C::PlayerInfoUpdate(p) => {
+            for entry in &p.entries {
+                if let Some(name) = &entry.name {
+                    crate::game::svc_voice::set_player_name(entry.uuid.to_be_bytes(), name);
+                }
+            }
+        }
         C::AddEntity(p) => {
             let key = p.uuid.to_be_bytes();
             crate::game::svc_voice::map_entity(p.id, key);

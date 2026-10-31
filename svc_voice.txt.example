@@ -44,3 +44,12 @@ distance_scale = 1.0
 
 # Even out a quiet or loud microphone automatically.
 agc = on
+
+# Record every speaker into this directory, one 16-bit mono WAV per player,
+# named by their UUID. Off by default: recordings fill a disk quickly.
+record = off
+record_dir = svc_voice-recordings
+
+# Per-player volume, 0..2, one line per player. Names as they are in game.
+#volume.Steve = 0.4
+#volume.Alex = 1.5

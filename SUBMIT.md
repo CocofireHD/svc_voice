@@ -6,7 +6,7 @@ there. So this page is the copy for the form at <https://playhorizon.dev/mods/su
 
 ## File
 
-`svc_voice-0.1.1.hnmod` from the [v0.4.0 release](https://github.com/CocofireHD/svc_voice/releases/tag/v0.4.0),
+`svc_voice-0.1.1.hnmod` from the [v0.5.0 release](https://github.com/CocofireHD/svc_voice/releases/tag/v0.5.0),
 with its `.minisig` beside it.
 
 ## The fields
@@ -23,7 +23,7 @@ with its `.minisig` beside it.
 | source | https://github.com/CocofireHD/svc_voice |
 | icon | `icons/svc_voice.png` |
 | public key | `RWShVhK8k7rY2j8oOAiDUIOI0R9iloJlXHe+muadSHVUNqiA0/aRjKz1` |
-| version | 0.4.0 |
+| version | 0.5.0 |
 | game | 26.3 |
 
 ### Description
@@ -43,6 +43,7 @@ without the plugin it does nothing at all.
 ### Changelog
 
 ```
+0.5.0 — per-player volume and WAV recording.
 0.4.0 — whisper, distance scale, automatic gain, microphone test.
 0.3.0 — password-protected groups, /vc commands.
 0.2.0 — settings file.

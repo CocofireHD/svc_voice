@@ -296,6 +296,10 @@ pub struct VoicePipeline {
     lp: f32,
     /// Microphone gain the automatic level control has settled on.
     agc_gain: f32,
+    /// Where played frames are written, when recording is on.
+    recorder: Option<crate::audio::record::Recorder>,
+    /// Per-speaker volume, 0..2; a sender not listed plays at 1.0.
+    player_gains: std::collections::HashMap<Uuid, f32>,
     /// Whether the last frame we sent opened the stream (for the stop packet).
     sending: bool,
     /// Last frame that passed the threshold, for the hangover.
@@ -321,6 +325,8 @@ impl VoicePipeline {
             group_frames: 0,
             lp: 0.0,
             agc_gain: 1.0,
+            recorder: None,
+            player_gains: std::collections::HashMap::new(),
             sending: false,
             last_loud: None,
             ptt: false,
@@ -374,6 +380,45 @@ impl VoicePipeline {
 
     pub fn set_agc(&mut self, on: bool) {
         self.cfg.agc = on;
+    }
+
+    /// Start writing every played frame to `dir`, one file per speaker.
+    pub fn start_recording(&mut self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        self.recorder = Some(crate::audio::record::Recorder::open(
+            dir,
+            crate::audio::SAMPLE_RATE,
+        )?);
+        Ok(())
+    }
+
+    pub fn stop_recording(&mut self) {
+        if let Some(mut rec) = self.recorder.take() {
+            let _ = rec.finish();
+        }
+    }
+
+    /// Replace the per-speaker volume table. Cheap to call every tick: the
+    /// table is as small as the number of people talking.
+    pub fn set_player_gains(&mut self, gains: std::collections::HashMap<Uuid, f32>) {
+        self.player_gains = gains;
+    }
+
+    /// The gain a speaker is played at, 1.0 when not configured.
+    pub fn player_gain(&self, sender: Uuid) -> f32 {
+        self.player_gains
+            .get(&sender)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.0, 2.0)
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    /// Frames written to disk so far.
+    pub fn recorded_tracks(&self) -> usize {
+        self.recorder.as_ref().map(|r| r.tracks()).unwrap_or(0)
     }
 
     pub fn gate(&self) -> Gate {
@@ -551,6 +596,11 @@ impl VoicePipeline {
                         if muffled {
                             lowpass(&mut pcm, &mut self.lp);
                         }
+                        // The file gets the voice before placement, so a
+                        // recording does not bake in the player's position.
+                        if let Some(rec) = self.recorder.as_mut() {
+                            let _ = rec.write(sound.sender, &pcm);
+                        }
                         play(&pcm, gain, pan, sink);
                         self.stats.concealed += 1;
                         self.stats.played += 1;
@@ -566,6 +616,9 @@ impl VoicePipeline {
                 Ok(mut pcm) => {
                     if muffled {
                         lowpass(&mut pcm, &mut self.lp);
+                    }
+                    if let Some(rec) = self.recorder.as_mut() {
+                        let _ = rec.write(sound.sender, &pcm);
                     }
                     play(&pcm, gain, pan, sink);
                     self.stats.played += 1;
@@ -658,6 +711,7 @@ impl VoicePipeline {
             if sound.group {
                 self.group_frames += 1;
             }
+            let gain = gain * self.player_gain(sound.sender);
             played += self.deliver_with_gain(now, &sound, gain, pan, muffled, sink);
         }
         self.capture(mic, client);
