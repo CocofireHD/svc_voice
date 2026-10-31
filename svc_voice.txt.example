@@ -32,6 +32,15 @@ volume = 1.0
 mute_key = M
 ptt_key = CapsLock
 gate_key = V
+# Whisper: the server halves your radius while this is held.
+whisper_key = LeftAlt
 
 # Muffle voices that have a wall between you and them.
 occlusion = on
+
+# Scale the audible radius the server sends: 0.5 hears half as far, 2 twice as
+# far. 1.0 obeys the server.
+distance_scale = 1.0
+
+# Even out a quiet or loud microphone automatically.
+agc = on

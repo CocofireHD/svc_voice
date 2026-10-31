@@ -142,6 +142,7 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
     let mute_key = key_of(&settings.mute_key).unwrap_or(KeyCode::KeyM);
     let ptt_key = key_of(&settings.ptt_key).unwrap_or(KeyCode::CapsLock);
     let gate_key = key_of(&settings.gate_key).unwrap_or(KeyCode::KeyV);
+    let whisper_key = key_of(&settings.whisper_key).unwrap_or(KeyCode::AltLeft);
     let pressed = game.player.is_some() && game.remote.is_some() && game.keys.contains(&mute_key);
     if crate::game::svc_voice::mute_key_edge(pressed) {
         let disabled = crate::game::svc_voice::toggle_mute();
@@ -157,6 +158,7 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
     // CapsLock is push-to-talk; V cycles voice activity, always-on and PTT.
     let in_game = game.player.is_some() && game.remote.is_some();
     crate::game::svc_voice::set_ptt(in_game && game.keys.contains(&ptt_key));
+    crate::game::svc_voice::set_whisper(in_game && game.keys.contains(&whisper_key));
     if let Some(mode) = crate::game::svc_voice::cycle_gate(in_game && game.keys.contains(&gate_key)) {
         log::info!("svc_voice: gate {mode}");
     }

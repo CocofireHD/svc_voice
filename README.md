@@ -132,6 +132,7 @@ Two things about the harness itself, worth knowing (both pre-existing, not cause
 /vc create isolated <name> [password]     members only, and you hear only them
 /vc join <name> [password]
 /vc leave
+/vc test [seconds]                        play your own microphone back locally
 /vc list
 ```
 
@@ -157,6 +158,9 @@ every key with its default.
 | `mute_key` | `M` | microphone toggle |
 | `ptt_key` | `CapsLock` | push-to-talk |
 | `gate_key` | `V` | cycles the three modes |
+| `whisper_key` | `LeftAlt` | hold to whisper: half radius |
+| `distance_scale` | `1.0` | scale the audible radius, 0.1..4 |
+| `agc` | `on` | even out the microphone level |
 | `occlusion` | `on` | muffle voices behind walls |
 
 A bad value never takes the rest of the file with it: it is ignored and the default stands. The

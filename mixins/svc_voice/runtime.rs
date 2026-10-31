@@ -90,6 +90,10 @@ static GROUP_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 // A join typed before the server had sent its group list: the tick retries it
 // as soon as the name shows up, instead of making the player type it again.
 static PENDING_JOIN: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+// Hold the whisper key: the server halves the radius for these frames.
+static WHISPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// A microphone test runs until this instant, playing the mic to the speakers.
+static MIC_TEST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 fn with_groups<R>(f: impl FnOnce(&mut svc_engine::protocol::groups::Groups) -> R) -> R {
     let mut slot = GROUPS.lock().unwrap();
@@ -128,6 +132,34 @@ pub fn current_group() -> Option<svc_engine::protocol::groups::GroupInfo> {
 /// `0x03` frames the session has seen, played or not.
 pub fn group_packets_seen() -> u64 {
     GROUP_PACKETS.load(Ordering::Relaxed)
+}
+
+pub fn set_whisper(on: bool) {
+    WHISPER.store(on, Ordering::Relaxed);
+}
+
+pub fn whispering() -> bool {
+    WHISPER.load(Ordering::Relaxed)
+}
+
+pub fn start_mic_test(seconds: u64) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds.clamp(1, 60));
+    *MIC_TEST.lock().unwrap() = Some(until);
+    log::info!("svc_voice: microphone test for {seconds}s, listen for yourself");
+}
+
+/// True while a microphone test should keep running; expires by itself.
+pub fn mic_test_active() -> bool {
+    let mut slot = MIC_TEST.lock().unwrap();
+    match *slot {
+        Some(until) if std::time::Instant::now() < until => true,
+        Some(_) => {
+            *slot = None;
+            log::info!("svc_voice: microphone test finished");
+            false
+        }
+        None => false,
+    }
 }
 
 pub fn request_join(name: &str, password: Option<&str>) {
@@ -204,7 +236,10 @@ pub struct Config {
     pub mute_key: String,
     pub ptt_key: String,
     pub gate_key: String,
+    pub whisper_key: String,
     pub occlusion: bool,
+    pub distance_scale: f32,
+    pub agc: bool,
 }
 
 impl Default for Config {
@@ -219,7 +254,10 @@ impl Default for Config {
             mute_key: "M".into(),
             ptt_key: "CapsLock".into(),
             gate_key: "V".into(),
+            whisper_key: "LeftAlt".into(),
             occlusion: true,
+            distance_scale: 1.0,
+            agc: true,
         }
     }
 }
@@ -262,6 +300,20 @@ impl Config {
                 "mute_key" => cfg.mute_key = value.to_string(),
                 "ptt_key" => cfg.ptt_key = value.to_string(),
                 "gate_key" => cfg.gate_key = value.to_string(),
+                "whisper_key" => cfg.whisper_key = value.to_string(),
+                "distance_scale" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        if (0.1..=4.0).contains(&v) {
+                            cfg.distance_scale = v;
+                        }
+                    }
+                }
+                "agc" => {
+                    cfg.agc = !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "0"
+                    )
+                }
                 "occlusion" => {
                     cfg.occlusion = !matches!(
                         value.to_ascii_lowercase().as_str(),
@@ -628,11 +680,20 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                 pipe.set_threshold(cfg.threshold);
                 pipe.set_hangover(std::time::Duration::from_millis(cfg.hangover_ms));
                 pipe.set_volume(cfg.volume);
+                pipe.set_distance_scale(cfg.distance_scale);
+                pipe.set_agc(cfg.agc);
                 while !STOP.load(Ordering::SeqCst) {
                     // The pipeline does not read the socket: the caller pumps,
                     // which is also what drives the session's timers.
                     pipe.set_gate(gate_mode());
                     pipe.set_ptt(ptt_held());
+                    pipe.set_whisper(whispering());
+                    if mic_test_active() {
+                        // Local monitoring: microphone straight to the speakers.
+                        pipe.loopback(&mut mic, &sink);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
                     if let Err(e) = client.pump() {
                         return Err(format!("pump: {e}"));
                     }
@@ -824,6 +885,20 @@ mod tests {
         assert_eq!(cfg.mute_key, "N");
         assert!(!cfg.occlusion);
         assert_eq!(cfg.ptt_key, "CapsLock", "untouched keys keep their default");
+    }
+
+    #[test]
+    fn the_newer_settings_are_read_too() {
+        let cfg = Config::parse(
+            "whisper_key = LeftShift\ndistance_scale = 0.5\nagc = off\n",
+        );
+        assert_eq!(cfg.whisper_key, "LeftShift");
+        assert_eq!(cfg.distance_scale, 0.5);
+        assert!(!cfg.agc);
+        let d = Config::default();
+        assert_eq!(d.whisper_key, "LeftAlt");
+        assert_eq!(d.distance_scale, 1.0);
+        assert!(d.agc);
     }
 
     #[test]

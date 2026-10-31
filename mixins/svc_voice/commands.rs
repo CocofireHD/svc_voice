@@ -8,6 +8,7 @@
 //   /vc create open|isolated <name> [password]
 //   /vc join <name> [password]
 //   /vc leave
+//   /vc test [seconds]                  play the microphone back locally
 //   /vc list
 //   /vc who
 fn svc_voice_commands(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
@@ -105,6 +106,14 @@ fn svc_voice_commands(game: &mut crate::game::Game<'_>, command: &str, ran: &mut
             log::info!("svc_voice: leaving the group");
             *ran = true;
         }
+        "test" => {
+            let seconds = words
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            crate::game::svc_voice::start_mic_test(seconds);
+            *ran = true;
+        }
         "list" | "who" => {
             log::info!(
                 "svc_voice: groups: {}",
@@ -114,7 +123,7 @@ fn svc_voice_commands(game: &mut crate::game::Game<'_>, command: &str, ran: &mut
         }
         _ => {
             log::info!(
-                "svc_voice: /vc create|join|leave|list — groups: {}",
+                "svc_voice: /vc create|join|leave|test|list — groups: {}",
                 crate::game::svc_voice::group_summary()
             );
             *ran = true;

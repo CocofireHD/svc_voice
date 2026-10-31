@@ -108,6 +108,12 @@ pub struct PipelineConfig {
     pub hangover: std::time::Duration,
     /// Output volume, 0..2. 1.0 is untouched.
     pub volume: f32,
+    /// Scales the audible radius the server sends. 1.0 obeys it exactly.
+    pub distance_scale: f32,
+    /// Whisper: the server halves the radius for these frames (§7.4).
+    pub whispering: bool,
+    /// Even out the microphone level toward [`AGC_TARGET`].
+    pub agc: bool,
 }
 
 impl Default for PipelineConfig {
@@ -119,6 +125,9 @@ impl Default for PipelineConfig {
             threshold: 0.012,
             hangover: std::time::Duration::from_millis(300),
             volume: 1.0,
+            distance_scale: 1.0,
+            whispering: false,
+            agc: true,
         }
     }
 }
@@ -232,6 +241,9 @@ pub fn lowpass(pcm: &mut [f32], state: &mut f32) {
     }
 }
 
+/// The microphone level the automatic gain aims for, RMS.
+pub const AGC_TARGET: f32 = 0.08;
+
 /// How much a wall takes off a voice, on top of the low-pass.
 pub const OCCLUDED_GAIN: f32 = 0.55;
 
@@ -282,6 +294,8 @@ pub struct VoicePipeline {
     group_frames: u64,
     /// Low-pass state, carried between frames.
     lp: f32,
+    /// Microphone gain the automatic level control has settled on.
+    agc_gain: f32,
     /// Whether the last frame we sent opened the stream (for the stop packet).
     sending: bool,
     /// Last frame that passed the threshold, for the hangover.
@@ -306,6 +320,7 @@ impl VoicePipeline {
             occluded: 0,
             group_frames: 0,
             lp: 0.0,
+            agc_gain: 1.0,
             sending: false,
             last_loud: None,
             ptt: false,
@@ -347,6 +362,18 @@ impl VoicePipeline {
 
     pub fn volume(&self) -> f32 {
         self.cfg.volume
+    }
+
+    pub fn set_distance_scale(&mut self, scale: f32) {
+        self.cfg.distance_scale = scale.clamp(0.1, 4.0);
+    }
+
+    pub fn set_whisper(&mut self, on: bool) {
+        self.cfg.whispering = on;
+    }
+
+    pub fn set_agc(&mut self, on: bool) {
+        self.cfg.agc = on;
     }
 
     pub fn gate(&self) -> Gate {
@@ -395,9 +422,47 @@ impl VoicePipeline {
 
     /// Take everything the microphone produced since the last tick and send it.
     /// Returns how many frames reached the session.
+    /// Microphone test: play what the microphone hears straight to the
+    /// speakers, without encoding, so there is no round trip and no server.
+    pub fn loopback(&mut self, mic: &mut dyn MicSource, sink: &dyn SpeakerSink) -> usize {
+        let mut played = 0;
+        for frame in mic.drain() {
+            self.level = frame_level(&frame);
+            sink.push(&frame);
+            played += 1;
+        }
+        played
+    }
+
+    /// Even out the microphone: move the gain toward AGC_TARGET, slowly, and
+    /// only while there is something to measure. A silent frame leaves the
+    /// gain alone instead of amplifying the noise floor.
+    fn apply_agc(&mut self, frame: &mut [f32]) {
+        let level = frame_level(frame);
+        if level < 1e-4 {
+            return;
+        }
+        let want = (AGC_TARGET / level).clamp(0.5, 4.0);
+        // Attack fast enough for a whisper, release slow enough not to pump.
+        let rate = if want < self.agc_gain { 0.25 } else { 0.05 };
+        self.agc_gain += (want - self.agc_gain) * rate;
+        let gain = self.agc_gain;
+        for s in frame.iter_mut() {
+            *s = (*s * gain).clamp(-1.0, 1.0);
+        }
+    }
+
+    /// The gain the level control currently applies; 1.0 when it is off.
+    pub fn agc_gain(&self) -> f32 {
+        self.agc_gain
+    }
+
     pub fn capture(&mut self, mic: &mut dyn MicSource, client: &mut ClientSession) -> usize {
         let mut sent = 0;
-        for frame in mic.drain() {
+        for mut frame in mic.drain() {
+            if self.cfg.agc {
+                self.apply_agc(&mut frame);
+            }
             let level = frame_level(&frame);
             self.level = level;
             let now = Instant::now();
@@ -416,7 +481,7 @@ impl VoicePipeline {
                 // Tell the server the stream stopped once, then stay quiet:
                 // §6.6 reads an empty payload as "speaker stopped".
                 if self.sending {
-                    match client.push_mic(&[], false) {
+                    match client.push_mic(&[], self.cfg.whispering) {
                         Ok(()) => self.sending = false,
                         Err(_) => self.stats.mic_rejected += 1,
                     }
@@ -431,7 +496,7 @@ impl VoicePipeline {
                     continue;
                 }
             };
-            match client.push_mic(&packet, false) {
+            match client.push_mic(&packet, self.cfg.whispering) {
                 Ok(()) => {
                     self.stats.mic_frames += 1;
                     self.sending = true;
@@ -567,8 +632,16 @@ impl VoicePipeline {
             let Incoming::Sound(sound) = event else {
                 continue;
             };
-            let Some((gain, pan, muffled)) =
-                positional_params(&sound, listener, look, &position_of, &occluded_of)
+            let Some((gain, pan, muffled)) = positional_params(
+                &SoundFrame {
+                    distance: sound.distance * self.cfg.distance_scale,
+                    ..(*sound).clone()
+                },
+                listener,
+                look,
+                &position_of,
+                &occluded_of,
+            )
             else {
                 // §7.4: beyond the radius this client plays nothing.
                 continue;
@@ -608,6 +681,57 @@ mod tests {
         fn drain(&mut self) -> Vec<Vec<f32>> {
             std::mem::take(&mut self.frames)
         }
+    }
+
+    #[test]
+    fn the_level_control_lifts_a_quiet_microphone_and_leaves_silence_alone() {
+        let mut p = VoicePipeline::new(PipelineConfig::default()).unwrap();
+        let mut quiet = vec![0.01f32; FRAME_SAMPLES];
+        // A few frames: the gain moves toward the target, not in one jump.
+        for _ in 0..40 {
+            p.apply_agc(&mut quiet);
+        }
+        let level = frame_level(&quiet);
+        assert!(level > 0.02, "quiet input got louder: {level}");
+        assert!(p.agc_gain() <= 4.0, "gain stays bounded");
+
+        let before = p.agc_gain();
+        let mut silence = vec![0.0f32; FRAME_SAMPLES];
+        p.apply_agc(&mut silence);
+        assert_eq!(p.agc_gain(), before, "silence does not pump the gain");
+    }
+
+    #[test]
+    fn the_distance_scale_shortens_or_lengthens_the_radius() {
+        let mut p = VoicePipeline::new(PipelineConfig::default()).unwrap();
+        assert_eq!(p.cfg.distance_scale, 1.0, "obeys the server by default");
+        p.set_distance_scale(0.5);
+        assert_eq!(p.cfg.distance_scale, 0.5);
+        p.set_distance_scale(99.0);
+        assert_eq!(p.cfg.distance_scale, 4.0, "clamped");
+    }
+
+    #[test]
+    fn whispering_and_agc_are_switches() {
+        let mut p = VoicePipeline::new(PipelineConfig::default()).unwrap();
+        assert!(!p.cfg.whispering);
+        p.set_whisper(true);
+        assert!(p.cfg.whispering);
+        assert!(p.cfg.agc, "on by default");
+        p.set_agc(false);
+        assert!(!p.cfg.agc);
+    }
+
+    #[test]
+    fn the_microphone_test_plays_the_microphone_without_the_network() {
+        let mut p = VoicePipeline::new(PipelineConfig::default()).unwrap();
+        let sink = TestSink::default();
+        let mut mic = TestMic {
+            frames: vec![vec![0.3; FRAME_SAMPLES]; 2],
+        };
+        assert_eq!(p.loopback(&mut mic, &sink), 2);
+        assert_eq!(sink.frames(), 2);
+        assert!((p.level() - 0.3).abs() < 1e-4, "the meter still works: {}", p.level());
     }
 
     #[test]
