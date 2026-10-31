@@ -9,6 +9,7 @@
 //   /vc join <name> [password]
 //   /vc leave
 //   /vc test [seconds]                  play the microphone back locally
+//   /vc speaker [seconds]               play a 440 Hz tone
 //   /vc list
 //   /vc who
 fn svc_voice_commands(game: &mut crate::game::Game<'_>, command: &str, ran: &mut bool) {
@@ -112,6 +113,11 @@ fn svc_voice_commands(game: &mut crate::game::Game<'_>, command: &str, ran: &mut
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(5);
             crate::game::svc_voice::start_mic_test(seconds);
+            *ran = true;
+        }
+        "speaker" => {
+            let seconds = words.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
+            crate::game::svc_voice::start_speaker_test(seconds);
             *ran = true;
         }
         "list" | "who" => {

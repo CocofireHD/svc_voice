@@ -45,6 +45,9 @@ distance_scale = 1.0
 # Even out a quiet or loud microphone automatically.
 agc = on
 
+# Microphone amplification, 0..8. 1.0 is untouched; AGC works on top of it.
+mic_gain = 1.0
+
 # Record every speaker into this directory, one 16-bit mono WAV per player,
 # named by their UUID. Off by default: recordings fill a disk quickly.
 record = off

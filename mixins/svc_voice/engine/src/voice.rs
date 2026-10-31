@@ -114,6 +114,8 @@ pub struct PipelineConfig {
     pub whispering: bool,
     /// Even out the microphone level toward [`AGC_TARGET`].
     pub agc: bool,
+    /// Microphone amplification, applied before the encoder. 1.0 is untouched.
+    pub mic_gain: f32,
 }
 
 impl Default for PipelineConfig {
@@ -128,6 +130,7 @@ impl Default for PipelineConfig {
             distance_scale: 1.0,
             whispering: false,
             agc: true,
+            mic_gain: 1.0,
         }
     }
 }
@@ -382,6 +385,24 @@ impl VoicePipeline {
         self.cfg.agc = on;
     }
 
+    pub fn set_mic_gain(&mut self, gain: f32) {
+        self.cfg.mic_gain = gain.clamp(0.0, 8.0);
+    }
+
+    /// Play a test tone through the speakers: the speaker half of a sound
+    /// check, so a player can tell which output device they are on.
+    pub fn play_tone(&self, sink: &dyn SpeakerSink, seconds: f32) {
+        let frames = (seconds.max(0.1) * 10.0).round() as usize;
+        for i in 0..frames {
+            let tone = crate::audio::tone_frame(440.0, i as u64);
+            let mut pcm = tone;
+            for s in pcm.iter_mut() {
+                *s *= 0.25;
+            }
+            sink.push(&pcm);
+        }
+    }
+
     /// Start writing every played frame to `dir`, one file per speaker.
     pub fn start_recording(&mut self, dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         self.recorder = Some(crate::audio::record::Recorder::open(
@@ -505,6 +526,12 @@ impl VoicePipeline {
     pub fn capture(&mut self, mic: &mut dyn MicSource, client: &mut ClientSession) -> usize {
         let mut sent = 0;
         for mut frame in mic.drain() {
+            if (self.cfg.mic_gain - 1.0).abs() > f32::EPSILON {
+                let g = self.cfg.mic_gain;
+                for s in frame.iter_mut() {
+                    *s = (*s * g).clamp(-1.0, 1.0);
+                }
+            }
             if self.cfg.agc {
                 self.apply_agc(&mut frame);
             }

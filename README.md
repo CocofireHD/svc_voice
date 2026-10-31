@@ -133,6 +133,7 @@ Two things about the harness itself, worth knowing (both pre-existing, not cause
 /vc join <name> [password]
 /vc leave
 /vc test [seconds]                        play your own microphone back locally
+/vc speaker [seconds]                     play a 440 Hz tone
 /vc list
 ```
 
@@ -161,6 +162,7 @@ every key with its default.
 | `whisper_key` | `LeftAlt` | hold to whisper: half radius |
 | `distance_scale` | `1.0` | scale the audible radius, 0.1..4 |
 | `agc` | `on` | even out the microphone level |
+| `mic_gain` | `1.0` | microphone amplification, 0..8 |
 | `record` | `off` | write every speaker to a WAV file |
 | `record_dir` | `svc_voice-recordings` | where those files go |
 | `volume.<name>` | `1.0` | per-player volume, 0..2 |

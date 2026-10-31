@@ -96,6 +96,8 @@ static PENDING_JOIN: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
 static WHISPER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // A microphone test runs until this instant, playing the mic to the speakers.
 static MIC_TEST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+// A speaker test plays a tone from the voice thread, so it interrupts nothing.
+static SPEAKER_TEST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 fn with_groups<R>(f: impl FnOnce(&mut svc_engine::protocol::groups::Groups) -> R) -> R {
     let mut slot = GROUPS.lock().unwrap();
@@ -178,6 +180,24 @@ pub fn set_whisper(on: bool) {
 
 pub fn whispering() -> bool {
     WHISPER.load(Ordering::Relaxed)
+}
+
+pub fn start_speaker_test(seconds: u64) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds.clamp(1, 30));
+    *SPEAKER_TEST.lock().unwrap() = Some(until);
+    log::info!("svc_voice: speaker test for {seconds}s, a 440 Hz tone");
+}
+
+fn speaker_test_active() -> bool {
+    let mut slot = SPEAKER_TEST.lock().unwrap();
+    match *slot {
+        Some(until) if std::time::Instant::now() < until => true,
+        Some(_) => {
+            *slot = None;
+            false
+        }
+        None => false,
+    }
 }
 
 pub fn start_mic_test(seconds: u64) {
@@ -282,6 +302,7 @@ pub struct Config {
     pub record_dir: String,
     /// `volume.<name> = 0.5`, keyed lowercase.
     pub player_volume: std::collections::HashMap<String, f32>,
+    pub mic_gain: f32,
 }
 
 impl Default for Config {
@@ -303,6 +324,7 @@ impl Default for Config {
             record: false,
             record_dir: "svc_voice-recordings".into(),
             player_volume: std::collections::HashMap::new(),
+            mic_gain: 1.0,
         }
     }
 }
@@ -360,6 +382,13 @@ impl Config {
                     )
                 }
                 "record_dir" if !value.is_empty() => cfg.record_dir = value.to_string(),
+                "mic_gain" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        if (0.0..=8.0).contains(&v) {
+                            cfg.mic_gain = v;
+                        }
+                    }
+                }
                 "agc" => {
                     cfg.agc = !matches!(
                         value.to_ascii_lowercase().as_str(),
@@ -743,6 +772,7 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                 pipe.set_volume(cfg.volume);
                 pipe.set_distance_scale(cfg.distance_scale);
                 pipe.set_agc(cfg.agc);
+                pipe.set_mic_gain(cfg.mic_gain);
                 if cfg.record {
                     match pipe.start_recording(&cfg.record_dir) {
                         Ok(()) => log::info!(
@@ -759,6 +789,11 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     pipe.set_ptt(ptt_held());
                     pipe.set_whisper(whispering());
                     pipe.set_player_gains(player_gains());
+                    if speaker_test_active() {
+                        pipe.play_tone(&sink, 0.1);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
                     if mic_test_active() {
                         // Local monitoring: microphone straight to the speakers.
                         pipe.loopback(&mut mic, &sink);
