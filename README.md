@@ -7,8 +7,8 @@ This folder is the Simple Voice Chat client packaged the way Horizon's market ta
 python tools/package.py     # -> target/svc_voice-0.1.0.hnmod
 ```
 
-Current artefact: `target/svc_voice-0.1.0.hnmod`, 356 135 bytes, 91 entries,
-sha256 `f67f9d1e09d8fdf878ac3b8f64fc55d6e8fc2e9953265aa02cc792af335e01e2`.
+Current artefact: `target/svc_voice-0.1.0.hnmod`, 357 782 bytes, 91 entries,
+sha256 `2328c360d54a5ed709bc5fb1b6d1fa2bc89e076d786ad45ba685a3d49b1ce4ec`.
 Built from a clean clone of this repository, so the hash is reproducible: LF endings, same files,
 same order.
 
@@ -127,6 +127,9 @@ Two things about the harness itself, worth knowing (both pre-existing, not cause
 Join a server that runs Simple Voice Chat; the mod asks for the secret on its own and opens the
 session. **M** toggles your microphone (§8.1's one-byte `voicechat:update_state`), and every sound
 is attenuated by the speaker's distance with the radius the server sends.
+
+Sounds are panned between the ears by the angle to the speaker (constant power, so a voice
+crossing in front of you keeps its loudness), and the distance curve still sets the volume.
 
 The microphone is gated on voice activity by default: a frame is sent when its level passes 0.012
 RMS, and for 300 ms after the last loud one. **CapsLock** is push-to-talk while held, and **V**
