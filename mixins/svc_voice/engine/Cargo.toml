@@ -1,0 +1,25 @@
+[package]
+name = "svc-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Simple Voice Chat engine for the Horizon native mod: protocol, crypto, codec, audio"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# `heap` and `std` mirror opus-rs's own default features: without `heap` the
+# codec keeps its working buffers inline in the struct, which overflows a test
+# thread's stack.
+default = ["std", "heap", "device"]
+std = []
+heap = ["std"]
+device = ["dep:cpal"]
+
+# These must stay inside Horizon's Cargo.lock: a bundle crate may only use
+# registry packages that are already pinned there (E_CRATE_DEPENDENCY otherwise).
+[dependencies]
+ring = "0.17"
+cpal = { version = "0.16", optional = true }
+

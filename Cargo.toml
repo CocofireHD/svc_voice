@@ -1,0 +1,19 @@
+[package]
+name = "horizon-svc-voice"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Simple Voice Chat for Horizon"
+
+[lib]
+# This exact source is also injected as a same-crate module by horizon-mixins.
+path = "mixins/svc_voice/runtime.rs"
+
+# Mirrors the stage: the bundle crate is added to the dependent as a path dep.
+[dependencies]
+svc-engine = { path = "mixins/svc_voice/engine" }
+
+[workspace]
+members = ["tools/audit", "mixins/svc_voice/engine"]
+resolver = "2"

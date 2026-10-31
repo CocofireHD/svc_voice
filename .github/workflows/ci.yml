@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: engine tests
+        working-directory: mixins/svc_voice/engine
+        run: cargo test --lib
+      - name: module tests
+        run: cargo test -p horizon-svc-voice
+      - name: package
+        run: python3 tools/package.py
+      - name: checksum
+        run: sha256sum target/svc_voice-*.hnmod

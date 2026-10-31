@@ -1,0 +1,40 @@
+[mod]
+id = "svc_voice"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "ba6344a59cb9e755b730dcf02285fc0d33b97d3c"
+
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "svc_voice"
+source = "runtime.rs"
+
+# The bundle's own crate: protocol, crypto, Opus (vendored source) and audio.
+# Staged to native-crates/svc_voice/engine/ and added to horizon-client as
+# `svc-engine`. Its dependencies must exist in Horizon's Cargo.lock — `ring`
+# 0.17.14 and `cpal` 0.16.0 do; Opus cannot, so it is vendored as source.
+[[crate]]
+id = "engine"
+path = "engine"
+dependent = "horizon-client"
+
+[[injection]]
+id = "drive-voice-loop"
+kind = "HEAD"
+target = "horizon_client::game::Game<'_>::update_world"
+helper = "tick.rs"
+bindings = [{ name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" }]
+
+# Every serverbound packet passes here; that is where `voicechat:secret` lands.
+[[injection]]
+id = "plugin-messages"
+kind = "HEAD"
+target = "horizon_client::game::remote::Game<'_>::handle_packet"
+helper = "packet.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "packet", ty = "&horizon_protocol::packets::play::Clientbound", value = "&packet" },
+]
