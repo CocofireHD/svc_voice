@@ -345,6 +345,18 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     .map_err(|e| format!("microphone: {e}"))?;
                 let sink = svc_engine::audio::Playback::open(output.as_deref())
                     .map_err(|e| format!("output: {e}"))?;
+                // SVC_GATE picks the first mode: voice-activity (default),
+                // always-on, or push-to-talk.
+                if let Ok(name) = std::env::var("SVC_GATE") {
+                    GATE.store(
+                        match name.as_str() {
+                            "always" | "always-on" | "open" => 1,
+                            "ptt" | "push-to-talk" => 2,
+                            _ => 0,
+                        },
+                        Ordering::Relaxed,
+                    );
+                }
                 while !STOP.load(Ordering::SeqCst) {
                     // The pipeline does not read the socket: the caller pumps,
                     // which is also what drives the session's timers.
@@ -359,12 +371,13 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         &mut mic,
                         &sink,
                         listener_eye(),
+                        listener_look(),
                         |u| entity_position(&uuid_key(&u)),
                     );
                     *STATE.lock().unwrap() = Some(format!("{:?}", client.state()));
                     let s = client.stats();
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pos {} gate {} {}",
+                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} pos {} gate {} {}",
                         s.auth_sent,
                         s.connection_check_sent,
                         s.mic_frames_sent,
@@ -372,6 +385,7 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         pipe.level(),
                         s.sound_frames,
                         pipe.attenuated(),
+                        pipe.panned(),
                         known_speakers(),
                         gate_name_now(),
                         if ptt_held() { "ptt" } else { "" }

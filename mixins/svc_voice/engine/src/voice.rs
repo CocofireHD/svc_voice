@@ -28,6 +28,13 @@ pub trait MicSource {
 /// Where decoded audio goes.
 pub trait SpeakerSink {
     fn push(&self, pcm: &[f32]);
+
+    /// Both ears, the same length. Sinks that cannot pan mix down.
+    fn push_stereo(&self, left: &[f32], right: &[f32]) {
+        let n = left.len().min(right.len());
+        let mixed: Vec<f32> = (0..n).map(|i| (left[i] + right[i]) * 0.5).collect();
+        self.push(&mixed);
+    }
 }
 
 #[cfg(feature = "device")]
@@ -41,6 +48,10 @@ impl MicSource for crate::audio::Capture {
 impl SpeakerSink for crate::audio::Playback {
     fn push(&self, pcm: &[f32]) {
         crate::audio::Playback::push(self, pcm)
+    }
+
+    fn push_stereo(&self, left: &[f32], right: &[f32]) {
+        crate::audio::Playback::push_stereo(self, left, right)
     }
 }
 
@@ -148,6 +159,51 @@ pub fn distance_gain(listener: [f64; 3], sound: [f64; 3], max_distance: f32) -> 
     Some(v.clamp(0.0, 1.0))
 }
 
+/// Constant-power pan gains for a sound, from where the listener looks.
+///
+/// `right` is `look × up`, so a speaker on the player's right raises the right
+/// ear. Both gains are 0.707 at the centre and 1.0 at the side, which keeps the
+/// perceived loudness constant as a sound moves around.
+pub fn pan_gains(listener: [f64; 3], look: [f64; 3], sound: [f64; 3]) -> (f32, f32) {
+    let norm = |v: [f64; 3]| {
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if len < 1e-9 {
+            [0.0, 0.0, 0.0]
+        } else {
+            [v[0] / len, v[1] / len, v[2] / len]
+        }
+    };
+    let forward = norm(look);
+    // look × up, with up = +Y: (fy*uz - fz*uy, fz*ux - fx*uz, fx*uy - fy*ux)
+    let right = norm([
+        -forward[2],
+        0.0,
+        forward[0],
+    ]);
+    let offset = [sound[0] - listener[0], 0.0, sound[2] - listener[2]];
+    let dir = norm(offset);
+    let pan = (dir[0] * right[0] + dir[1] * right[1] + dir[2] * right[2]).clamp(-1.0, 1.0) as f32;
+    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
+}
+
+/// Play one decoded frame at `gain`, panned if the caller knows where the
+/// speaker is, mono otherwise.
+fn play(pcm: &[f32], gain: f32, pan: Option<(f32, f32)>, sink: &dyn SpeakerSink) {
+    match pan {
+        Some((left, right)) => {
+            let l: Vec<f32> = pcm.iter().map(|s| (s * gain * left).clamp(-1.0, 1.0)).collect();
+            let r: Vec<f32> = pcm.iter().map(|s| (s * gain * right).clamp(-1.0, 1.0)).collect();
+            sink.push_stereo(&l, &r);
+        }
+        None => {
+            let mut mono = pcm.to_vec();
+            apply_gain(&mut mono, gain);
+            sink.push(&mono);
+        }
+    }
+}
+
 /// Scale PCM in place, saturating at ±1.0 so a loud mix cannot clip into noise.
 pub fn apply_gain(pcm: &mut [f32], gain: f32) {
     if (gain - 1.0).abs() < f32::EPSILON {
@@ -170,6 +226,8 @@ pub struct VoicePipeline {
     inbox: Option<std::sync::mpsc::Receiver<Incoming>>,
     /// Sounds played quieter than full volume: proves the distance curve ran.
     attenuated: u64,
+    /// Sounds that were panned away from the centre: proves the stereo path ran.
+    panned: u64,
     /// Whether the last frame we sent opened the stream (for the stop packet).
     sending: bool,
     /// Last frame that passed the threshold, for the hangover.
@@ -190,6 +248,7 @@ impl VoicePipeline {
             stats: Stats::default(),
             inbox: None,
             attenuated: 0,
+            panned: 0,
             sending: false,
             last_loud: None,
             ptt: false,
@@ -223,6 +282,11 @@ impl VoicePipeline {
     /// The push-to-talk key, as last published by the game thread.
     pub fn set_ptt(&mut self, held: bool) {
         self.ptt = held;
+    }
+
+    /// Sounds delivered off-centre, left and right differing.
+    pub fn panned(&self) -> u64 {
+        self.panned
     }
 
     /// Level of the last captured frame, 0..1.
@@ -298,7 +362,7 @@ impl VoicePipeline {
     /// Feed one relayed sound packet through the jitter buffer and play what
     /// became ready. Returns the number of frames queued for playback.
     pub fn deliver(&mut self, now: Instant, sound: &SoundFrame, sink: &dyn SpeakerSink) -> usize {
-        self.deliver_with_gain(now, sound, 1.0, sink)
+        self.deliver_with_gain(now, sound, 1.0, None, sink)
     }
 
     /// Same, with a distance gain from [`distance_gain`] applied to every decoded
@@ -308,6 +372,7 @@ impl VoicePipeline {
         now: Instant,
         sound: &SoundFrame,
         gain: f32,
+        pan: Option<(f32, f32)>,
         sink: &dyn SpeakerSink,
     ) -> usize {
         let buffer = self
@@ -332,8 +397,7 @@ impl VoicePipeline {
             for _ in 0..delivery.lost {
                 match self.decoder.decode(None) {
                     Ok(mut pcm) => {
-                        apply_gain(&mut pcm, gain);
-                        sink.push(&pcm);
+                        play(&pcm, gain, pan, sink);
                         self.stats.concealed += 1;
                         self.stats.played += 1;
                         played += 1;
@@ -346,8 +410,7 @@ impl VoicePipeline {
             }
             match self.decoder.decode(Some(&delivery.data)) {
                 Ok(mut pcm) => {
-                    apply_gain(&mut pcm, gain);
-                    sink.push(&pcm);
+                    play(&pcm, gain, pan, sink);
                     self.stats.played += 1;
                     played += 1;
                 }
@@ -395,6 +458,7 @@ impl VoicePipeline {
         mic: &mut dyn MicSource,
         sink: &dyn SpeakerSink,
         listener: [f64; 3],
+        look: [f64; 3],
         position_of: F,
     ) -> usize
     where
@@ -423,10 +487,16 @@ impl VoicePipeline {
                 },
                 None => 1.0,
             };
+            let pan = speaker.map(|at| pan_gains(listener, look, at));
+            if let Some((l, r)) = pan {
+                if (l - r).abs() > 0.01 {
+                    self.panned += 1;
+                }
+            }
             if gain < 0.999 {
                 self.attenuated += 1;
             }
-            played += self.deliver_with_gain(now, &sound, gain, sink);
+            played += self.deliver_with_gain(now, &sound, gain, pan, sink);
         }
         self.capture(mic, client);
         played
@@ -449,6 +519,31 @@ mod tests {
         fn drain(&mut self) -> Vec<Vec<f32>> {
             std::mem::take(&mut self.frames)
         }
+    }
+
+    #[test]
+    fn a_sound_on_the_right_is_louder_in_the_right_ear() {
+        // Facing +Z, so the player's right is -X.
+        let (l, r) = pan_gains([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [-10.0, 0.0, 0.0]);
+        assert!(r > l + 0.5, "right {r} should beat left {l}");
+
+        let (l, r) = pan_gains([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [10.0, 0.0, 0.0]);
+        assert!(l > r + 0.5, "left {l} should beat right {r}");
+    }
+
+    #[test]
+    fn a_sound_straight_ahead_is_centred_and_equal_power() {
+        let (l, r) = pan_gains([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 12.0]);
+        assert!((l - r).abs() < 1e-5);
+        let power = l * l + r * r;
+        assert!((power - 1.0).abs() < 1e-4, "constant power, got {power}");
+        assert!((l - 0.7071).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_sound_behind_does_not_flip_the_channels() {
+        let (l, r) = pan_gains([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -12.0]);
+        assert!((l - r).abs() < 1e-5, "behind is still centred");
     }
 
     #[test]
@@ -672,7 +767,7 @@ mod tests {
             let mut q = VoicePipeline::new(PipelineConfig::default()).unwrap();
             let s2 = TestSink::default();
             let frame = sound(&mut q, 0, 1);
-            q.deliver_with_gain(now, &frame, 0.25, &s2);
+            q.deliver_with_gain(now, &frame, 0.25, None, &s2);
             crate::audio::rms(&s2.flat())
         };
         assert!(quiet < full * 0.5, "quiet {quiet:.3} vs full {full:.3}");

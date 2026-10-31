@@ -1,6 +1,6 @@
 [mod]
 id = "svc_voice"
-version = "0.1.1"
+version = "0.1.2"
 priority = 100
 
 [compatibility]

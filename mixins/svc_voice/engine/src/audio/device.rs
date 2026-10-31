@@ -243,8 +243,25 @@ impl Playback {
     }
 
     /// Queue one frame of 48 kHz mono PCM. Dropped if playback is gone.
+    /// Mono PCM: both ears get the same samples.
     pub fn push(&self, pcm: &[f32]) {
-        let _ = self.tx.send(pcm.to_vec());
+        let mut interleaved = Vec::with_capacity(pcm.len() * 2);
+        for s in pcm {
+            interleaved.push(*s);
+            interleaved.push(*s);
+        }
+        let _ = self.tx.send(interleaved);
+    }
+
+    /// Stereo PCM: `left` and `right` are the two ears, sample by sample.
+    pub fn push_stereo(&self, left: &[f32], right: &[f32]) {
+        let n = left.len().min(right.len());
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            interleaved.push(left[i]);
+            interleaved.push(right[i]);
+        }
+        let _ = self.tx.send(interleaved);
     }
 }
 
@@ -278,9 +295,23 @@ fn fill<T: Copy>(
         queue.extend(chunk);
     }
     for frame in out.chunks_mut(channels) {
-        let sample = queue.pop_front().unwrap_or(0.0);
-        for s in frame.iter_mut() {
-            *s = convert(sample);
+        // Frames are queued as (left, right) pairs; a mono device hears the
+        // average, a surround device gets silence in the extra channels.
+        let left = queue.pop_front().unwrap_or(0.0);
+        let right = queue.pop_front().unwrap_or(0.0);
+        if channels == 1 {
+            let mixed = (left + right) * 0.5;
+            frame[0] = convert(mixed);
+            continue;
+        }
+        for (i, s) in frame.iter_mut().enumerate() {
+            *s = convert(if i == 0 {
+                left
+            } else if i == 1 {
+                right
+            } else {
+                0.0
+            });
         }
     }
 }
@@ -360,12 +391,21 @@ mod tests {
     }
 
     #[test]
-    fn playback_spreads_mono_over_both_channels() {
+    fn playback_keeps_stereo_pairs_and_downmixes_for_mono() {
+        // Queued frames are (left, right) pairs: a stereo device gets them
+        // untouched, a mono device hears their average.
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
-        tx.send(vec![0.25, -0.5]).unwrap();
+        tx.send(vec![0.5, 0.0, -0.5, 0.25]).unwrap();
         let mut queue = VecDeque::new();
         let mut out = [0.0f32; 4];
         fill(&mut queue, &rx, &mut out, 2, |s| s);
-        assert_eq!(out, [0.25, 0.25, -0.5, -0.5]);
+        assert_eq!(out, [0.5, 0.0, -0.5, 0.25]);
+
+        let (tx2, rx2) = mpsc::channel::<Vec<f32>>();
+        tx2.send(vec![0.5, 0.0]).unwrap();
+        let mut queue2 = VecDeque::new();
+        let mut mono = [0.0f32; 1];
+        fill(&mut queue2, &rx2, &mut mono, 1, |s| s);
+        assert_eq!(mono, [0.25]);
     }
 }
