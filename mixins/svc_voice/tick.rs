@@ -53,6 +53,13 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
         ));
     }
 
+    // CapsLock is push-to-talk; V cycles voice activity, always-on and PTT.
+    let in_game = game.player.is_some() && game.remote.is_some();
+    crate::game::svc_voice::set_ptt(in_game && game.keys.contains(&KeyCode::CapsLock));
+    if let Some(mode) = crate::game::svc_voice::cycle_gate(in_game && game.keys.contains(&KeyCode::KeyV)) {
+        log::info!("svc_voice: gate {mode}");
+    }
+
     if let Some(c) = crate::game::svc_voice::take_counters_change() {
         log::info!("svc_voice: {c}");
     }

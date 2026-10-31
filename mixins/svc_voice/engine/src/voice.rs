@@ -44,11 +44,57 @@ impl SpeakerSink for crate::audio::Playback {
     }
 }
 
-#[derive(Debug, Clone)]
+/// What opens the microphone. The original sends only while the player talks
+/// or holds the key; sending silence costs bandwidth and hides nothing.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// Always on, the first releases' behaviour.
+    #[default]
+    Open,
+    /// Open while the frame's level passes the threshold, plus a hangover.
+    VoiceActivity,
+    /// Open only while the key is held.
+    PushToTalk,
+}
+
+/// Root-mean-square of a frame, the level the gate compares.
+pub fn frame_level(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = pcm.iter().map(|s| s * s).sum();
+    (sum / pcm.len() as f32).sqrt()
+}
+
+/// Whether the microphone sends this frame. Pure, so the rule is testable
+/// without a socket or a sound card.
+pub fn gate_opens(
+    gate: Gate,
+    level: f32,
+    threshold: f32,
+    since_loud: Option<std::time::Duration>,
+    hangover: std::time::Duration,
+    ptt: bool,
+) -> bool {
+    match gate {
+        Gate::Open => true,
+        Gate::VoiceActivity => {
+            level >= threshold || since_loud.is_some_and(|d| d < hangover)
+        }
+        Gate::PushToTalk => ptt,
+    }
+}
+
 pub struct PipelineConfig {
     /// Opus target bitrate in bit/s.
     pub bitrate: i32,
     pub jitter: JitterConfig,
+    /// When the microphone is allowed to send.
+    pub gate: Gate,
+    /// Level (RMS of the 20 ms frame) that counts as speech, 0..1.
+    pub threshold: f32,
+    /// How long the gate stays open after the last loud frame.
+    pub hangover: std::time::Duration,
 }
 
 impl Default for PipelineConfig {
@@ -56,6 +102,9 @@ impl Default for PipelineConfig {
         Self {
             bitrate: 24_000,
             jitter: JitterConfig::default(),
+            gate: Gate::Open,
+            threshold: 0.012,
+            hangover: std::time::Duration::from_millis(300),
         }
     }
 }
@@ -64,6 +113,8 @@ impl Default for PipelineConfig {
 pub struct Stats {
     /// Microphone frames handed to the session.
     pub mic_frames: u64,
+    /// Frames the gate kept back because nobody was talking.
+    pub mic_skipped: u64,
     /// Frames the session refused (stale, not connected, outbox full).
     pub mic_rejected: u64,
     /// Frames decoded and queued for playback.
@@ -119,6 +170,14 @@ pub struct VoicePipeline {
     inbox: Option<std::sync::mpsc::Receiver<Incoming>>,
     /// Sounds played quieter than full volume: proves the distance curve ran.
     attenuated: u64,
+    /// Whether the last frame we sent opened the stream (for the stop packet).
+    sending: bool,
+    /// Last frame that passed the threshold, for the hangover.
+    last_loud: Option<Instant>,
+    /// Push-to-talk key, set from the game thread.
+    ptt: bool,
+    /// Level of the last frame, for logging.
+    level: f32,
 }
 
 impl VoicePipeline {
@@ -131,6 +190,10 @@ impl VoicePipeline {
             stats: Stats::default(),
             inbox: None,
             attenuated: 0,
+            sending: false,
+            last_loud: None,
+            ptt: false,
+            level: 0.0,
         })
     }
 
@@ -142,6 +205,29 @@ impl VoicePipeline {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Choose what opens the microphone.
+    pub fn set_gate(&mut self, gate: Gate) {
+        if self.cfg.gate != gate {
+            self.cfg.gate = gate;
+            self.sending = false;
+            self.last_loud = None;
+        }
+    }
+
+    pub fn gate(&self) -> Gate {
+        self.cfg.gate
+    }
+
+    /// The push-to-talk key, as last published by the game thread.
+    pub fn set_ptt(&mut self, held: bool) {
+        self.ptt = held;
+    }
+
+    /// Level of the last captured frame, 0..1.
+    pub fn level(&self) -> f32 {
+        self.level
     }
 
     /// Sounds delivered with a distance gain below 1.0 (§7.4).
@@ -164,6 +250,32 @@ impl VoicePipeline {
     pub fn capture(&mut self, mic: &mut dyn MicSource, client: &mut ClientSession) -> usize {
         let mut sent = 0;
         for frame in mic.drain() {
+            let level = frame_level(&frame);
+            self.level = level;
+            let now = Instant::now();
+            if level >= self.cfg.threshold {
+                self.last_loud = Some(now);
+            }
+            let open = gate_opens(
+                self.cfg.gate,
+                level,
+                self.cfg.threshold,
+                self.last_loud.map(|t| now.duration_since(t)),
+                self.cfg.hangover,
+                self.ptt,
+            );
+            if !open {
+                // Tell the server the stream stopped once, then stay quiet:
+                // §6.6 reads an empty payload as "speaker stopped".
+                if self.sending {
+                    match client.push_mic(&[], false) {
+                        Ok(()) => self.sending = false,
+                        Err(_) => self.stats.mic_rejected += 1,
+                    }
+                }
+                self.stats.mic_skipped += 1;
+                continue;
+            }
             let packet = match self.encode_frame(&frame) {
                 Ok(p) => p,
                 Err(e) => {
@@ -174,6 +286,7 @@ impl VoicePipeline {
             match client.push_mic(&packet, false) {
                 Ok(()) => {
                     self.stats.mic_frames += 1;
+                    self.sending = true;
                     sent += 1;
                 }
                 Err(_) => self.stats.mic_rejected += 1,
@@ -336,6 +449,49 @@ mod tests {
         fn drain(&mut self) -> Vec<Vec<f32>> {
             std::mem::take(&mut self.frames)
         }
+    }
+
+    #[test]
+    fn voice_activity_opens_on_speech_and_closes_on_silence() {
+        let hang = Duration::from_millis(300);
+        // Loud enough: open.
+        assert!(gate_opens(Gate::VoiceActivity, 0.2, 0.012, None, hang, false));
+        // Quiet, never loud: closed.
+        assert!(!gate_opens(Gate::VoiceActivity, 0.001, 0.012, None, hang, false));
+        // Quiet, but the last loud frame is inside the hangover: still open.
+        assert!(gate_opens(
+            Gate::VoiceActivity,
+            0.001,
+            0.012,
+            Some(Duration::from_millis(120)),
+            hang,
+            false
+        ));
+        // The hangover ran out: closed.
+        assert!(!gate_opens(
+            Gate::VoiceActivity,
+            0.001,
+            0.012,
+            Some(Duration::from_millis(400)),
+            hang,
+            false
+        ));
+    }
+
+    #[test]
+    fn push_to_talk_ignores_the_level_in_both_directions() {
+        let hang = Duration::from_millis(300);
+        // Quiet but held: open — that is the point of the key.
+        assert!(gate_opens(Gate::PushToTalk, 0.0, 0.012, None, hang, true));
+        // Loud but released: closed.
+        assert!(!gate_opens(Gate::PushToTalk, 0.9, 0.012, None, hang, false));
+    }
+
+    #[test]
+    fn the_level_is_the_root_mean_square() {
+        assert_eq!(frame_level(&[]), 0.0);
+        assert!((frame_level(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+        assert!((frame_level(&[0.0; 960])).abs() < 1e-9);
     }
 
     #[test]

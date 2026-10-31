@@ -9,7 +9,7 @@
 // Opus, the last vendored as source because Horizon's `Cargo.lock` has no
 // codec crate and a bundle may not add one.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -86,6 +86,50 @@ pub fn entity_position(key: &[u8; 16]) -> Option<[f64; 3]> {
 /// How many speakers the client currently knows a position for.
 pub fn known_speakers() -> usize {
     POSITIONS.lock().unwrap().as_ref().map_or(0, HashMap::len)
+}
+
+/// The push-to-talk key, as the tick sees it.
+pub fn set_ptt(held: bool) {
+    PTT.store(held, Ordering::Relaxed);
+}
+
+pub fn ptt_held() -> bool {
+    PTT.load(Ordering::Relaxed)
+}
+
+/// 0 voice activity, 1 always on, 2 push-to-talk.
+pub fn gate_mode() -> svc_engine::voice::Gate {
+    match GATE.load(Ordering::Relaxed) {
+        1 => svc_engine::voice::Gate::Open,
+        2 => svc_engine::voice::Gate::PushToTalk,
+        _ => svc_engine::voice::Gate::VoiceActivity,
+    }
+}
+
+fn gate_name(mode: u8) -> &'static str {
+    match mode {
+        1 => "always-on",
+        2 => "push-to-talk",
+        _ => "voice-activity",
+    }
+}
+
+/// Cycle the gate on a key press; returns the new mode's name once per press.
+pub fn cycle_gate(held: bool) -> Option<&'static str> {
+    if !held {
+        GATE_HELD.store(false, Ordering::Relaxed);
+        return None;
+    }
+    if GATE_HELD.swap(true, Ordering::Relaxed) {
+        return None;
+    }
+    let next = (GATE.load(Ordering::Relaxed) + 1) % 3;
+    GATE.store(next, Ordering::Relaxed);
+    Some(gate_name(next))
+}
+
+pub fn gate_name_now() -> &'static str {
+    gate_name(GATE.load(Ordering::Relaxed))
 }
 
 /// True on the frame the key goes down, once per press.
@@ -234,6 +278,10 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 static COUNTERS: Mutex<Option<String>> = Mutex::new(None);
+// Voice activity by default; V cycles it, CapsLock is push-to-talk.
+static PTT: AtomicBool = AtomicBool::new(false);
+static GATE: AtomicU8 = AtomicU8::new(0);
+static GATE_HELD: AtomicBool = AtomicBool::new(false);
 // §8.1: the microphone switch, and the key edge that flips it.
 static MUTED: AtomicBool = AtomicBool::new(false);
 static MUTE_HELD: AtomicBool = AtomicBool::new(false);
@@ -289,13 +337,19 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                 let mut pipe = VoicePipeline::new(PipelineConfig::default())?;
                 pipe.attach(&mut client);
 
-                let mut mic = svc_engine::audio::Capture::open(None)
+                // Device override for testing and for players with two sound
+                // cards: SVC_INPUT_DEVICE / SVC_OUTPUT_DEVICE, substring match.
+                let input = std::env::var("SVC_INPUT_DEVICE").ok();
+                let output = std::env::var("SVC_OUTPUT_DEVICE").ok();
+                let mut mic = svc_engine::audio::Capture::open(input.as_deref())
                     .map_err(|e| format!("microphone: {e}"))?;
-                let sink = svc_engine::audio::Playback::open(None)
+                let sink = svc_engine::audio::Playback::open(output.as_deref())
                     .map_err(|e| format!("output: {e}"))?;
                 while !STOP.load(Ordering::SeqCst) {
                     // The pipeline does not read the socket: the caller pumps,
                     // which is also what drives the session's timers.
+                    pipe.set_gate(gate_mode());
+                    pipe.set_ptt(ptt_held());
                     if let Err(e) = client.pump() {
                         return Err(format!("pump: {e}"));
                     }
@@ -310,13 +364,17 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     *STATE.lock().unwrap() = Some(format!("{:?}", client.state()));
                     let s = client.stats();
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} snd {} att {} pos {}",
+                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pos {} gate {} {}",
                         s.auth_sent,
                         s.connection_check_sent,
                         s.mic_frames_sent,
+                        pipe.stats().mic_skipped,
+                        pipe.level(),
                         s.sound_frames,
                         pipe.attenuated(),
-                        known_speakers()
+                        known_speakers(),
+                        gate_name_now(),
+                        if ptt_held() { "ptt" } else { "" }
                     ));
                     if client.needs_secret() {
                         return Err("server asked for a new secret".into());
