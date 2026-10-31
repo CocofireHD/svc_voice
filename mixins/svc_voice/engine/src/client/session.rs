@@ -182,6 +182,9 @@ pub struct Stats {
     pub mic_refused: u64,
     pub mic_bytes_sent: u64,
     pub sound_frames: u64,
+    /// `0x03` frames, the group channel: the server only sends these to
+    /// members, so this is what proves a join took effect.
+    pub group_sound_frames: u64,
     pub sound_bytes: u64,
     pub stop_frames: u64,
     pub dropped: u64,
@@ -612,6 +615,7 @@ impl ClientSession {
                 sequence,
                 category,
             }) => {
+                self.stats.group_sound_frames += 1;
                 self.count_sound(&data);
                 self.emit(Incoming::Sound(Box::new(SoundFrame {
                     channel_id,

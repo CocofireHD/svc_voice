@@ -190,6 +190,37 @@ pub fn pan_gains(listener: [f64; 3], look: [f64; 3], sound: [f64; 3]) -> (f32, f
     (angle.cos(), angle.sin())
 }
 
+
+/// Gain, stereo placement and wall filtering for one frame, or `None` when it
+/// is out of earshot.
+///
+/// Group audio is non-positional (§5.3): full volume, centred, no wall filter,
+/// because the server already decided who hears it. Everything else is placed
+/// by distance, direction and line of sight.
+fn positional_params<F, O>(
+    sound: &SoundFrame,
+    listener: [f64; 3],
+    look: [f64; 3],
+    position_of: &F,
+    occluded_of: &O,
+) -> Option<(f32, Option<(f32, f32)>, bool)>
+where
+    F: Fn(Uuid) -> Option<[f64; 3]>,
+    O: Fn(Uuid) -> bool,
+{
+    if sound.group {
+        return Some((1.0, None, false));
+    }
+    let speaker = sound.position.or_else(|| position_of(sound.sender));
+    let gain = match speaker {
+        Some(at) => distance_gain(listener, at, sound.distance)?,
+        None => 1.0,
+    };
+    let pan = speaker.map(|at| pan_gains(listener, look, at));
+    let muffled = occluded_of(sound.sender);
+    Some((if muffled { gain * OCCLUDED_GAIN } else { gain }, pan, muffled))
+}
+
 /// One-pole low-pass at about 800 Hz for 48 kHz PCM: what a wall does to a
 /// voice. The state carries between frames so there is no click at the seam.
 pub fn lowpass(pcm: &mut [f32], state: &mut f32) {
@@ -247,6 +278,8 @@ pub struct VoicePipeline {
     panned: u64,
     /// Sounds muffled by a wall.
     occluded: u64,
+    /// Group frames played at full volume, non-positional.
+    group_frames: u64,
     /// Low-pass state, carried between frames.
     lp: f32,
     /// Whether the last frame we sent opened the stream (for the stop packet).
@@ -271,6 +304,7 @@ impl VoicePipeline {
             attenuated: 0,
             panned: 0,
             occluded: 0,
+            group_frames: 0,
             lp: 0.0,
             sending: false,
             last_loud: None,
@@ -322,6 +356,11 @@ impl VoicePipeline {
     /// The push-to-talk key, as last published by the game thread.
     pub fn set_ptt(&mut self, held: bool) {
         self.ptt = held;
+    }
+
+    /// Group frames played non-positionally.
+    pub fn group_frames(&self) -> u64 {
+        self.group_frames
     }
 
     /// Sounds played through the wall filter.
@@ -528,33 +567,23 @@ impl VoicePipeline {
             let Incoming::Sound(sound) = event else {
                 continue;
             };
-            // §5.3: group audio is not positional.
-            if sound.group {
-                played += self.deliver(now, &sound, sink);
+            let Some((gain, pan, muffled)) =
+                positional_params(&sound, listener, look, &position_of, &occluded_of)
+            else {
+                // §7.4: beyond the radius this client plays nothing.
                 continue;
-            }
-            let speaker = sound.position.or_else(|| position_of(sound.sender));
-            let gain = match speaker {
-                Some(at) => match distance_gain(listener, at, sound.distance) {
-                    Some(gain) => gain,
-                    // §7.4: beyond the radius this client plays nothing.
-                    None => continue,
-                },
-                None => 1.0,
             };
-            let pan = speaker.map(|at| pan_gains(listener, look, at));
-            if let Some((l, r)) = pan {
-                if (l - r).abs() > 0.01 {
-                    self.panned += 1;
-                }
+            if pan.is_some_and(|(l, r)| (l - r).abs() > 0.01) {
+                self.panned += 1;
             }
-            let muffled = occluded_of(sound.sender);
-            let gain = if muffled { gain * OCCLUDED_GAIN } else { gain };
             if gain < 0.999 {
                 self.attenuated += 1;
             }
             if muffled {
                 self.occluded += 1;
+            }
+            if sound.group {
+                self.group_frames += 1;
             }
             played += self.deliver_with_gain(now, &sound, gain, pan, muffled, sink);
         }
@@ -579,6 +608,68 @@ mod tests {
         fn drain(&mut self) -> Vec<Vec<f32>> {
             std::mem::take(&mut self.frames)
         }
+    }
+
+    #[test]
+    fn group_audio_ignores_distance_direction_and_walls() {
+        // A group frame from 500 blocks away behind a wall: still full volume,
+        // centred, no filter — the server already decided who hears it.
+        let frame = SoundFrame {
+            channel_id: Uuid::from_u128(1),
+            sender: Uuid::from_u128(2),
+            data: vec![0xAB; 40],
+            sequence: 0,
+            distance: 0.0,
+            position: None,
+            group: true,
+            whispering: false,
+            category: None,
+        };
+        let params = positional_params(
+            &frame,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            &|_| Some([0.0, 0.0, -500.0]),
+            &|_| true,
+        );
+        assert_eq!(params, Some((1.0, None, false)));
+    }
+
+    #[test]
+    fn proximity_audio_still_falls_off_around_the_listener() {
+        let mut frame = SoundFrame {
+            channel_id: Uuid::from_u128(1),
+            sender: Uuid::from_u128(2),
+            data: vec![0xAB; 40],
+            sequence: 0,
+            distance: 48.0,
+            position: None,
+            group: false,
+            whispering: false,
+            category: None,
+        };
+        // Straight ahead at half the radius: quieter, centred, clear of walls.
+        let params = positional_params(
+            &frame,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            &|_| Some([0.0, 0.0, 24.0]),
+            &|_| false,
+        )
+        .expect("in earshot");
+        assert!((params.0 - 0.5).abs() < 1e-4, "gain {}", params.0);
+        assert!(params.1.is_some_and(|(l, r)| (l - r).abs() < 1e-4));
+
+        // Past the radius the server gave in the packet: inaudible.
+        frame.position = None;
+        let far = positional_params(
+            &frame,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            &|_| Some([0.0, 0.0, 60.0]),
+            &|_| false,
+        );
+        assert_eq!(far, None);
     }
 
     #[test]

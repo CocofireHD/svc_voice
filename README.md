@@ -122,6 +122,24 @@ Two things about the harness itself, worth knowing (both pre-existing, not cause
 - it disconnects about six seconds after joining, so a session test has to complete inside that
   window.
 
+## Groups
+
+`/vc` in chat, handled on the client before the server sees the line:
+
+```
+/vc create <name> [password]              a normal group: only members hear you
+/vc create open <name> [password]         members and players nearby hear you
+/vc create isolated <name> [password]     members only, and you hear only them
+/vc join <name> [password]
+/vc leave
+/vc list
+```
+
+Typing `/vc join Team` before the server has sent its group list is not an error: the client
+remembers the name and joins as soon as the group appears. Group audio is non-positional — full
+volume, no distance falloff, no wall filter — exactly as the server intends, since it decides who
+is in the group.
+
 ## Settings
 
 There is no menu, so the settings live in a file: `svc_voice.txt` in the game home directory —

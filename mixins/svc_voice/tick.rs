@@ -161,6 +161,34 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
         log::info!("svc_voice: gate {mode}");
     }
 
+    // A join typed before the group list arrived: send it once the name shows
+    // up. `groups_joined` clears the pending request, so this runs once.
+    if in_game {
+        if let Some((name, password)) = crate::game::svc_voice::take_pending_join() {
+            match crate::game::svc_voice::group_by_name(&name) {
+                Some(info) => match svc_engine::protocol::groups::set_group(
+                    info.id,
+                    password.as_deref(),
+                ) {
+                    Ok(payload) => {
+                        log::info!("svc_voice: joining group {name} (was waiting for the list)");
+                        game.send(
+                            horizon_protocol::packets::play::Serverbound::CustomPayload(
+                                horizon_protocol::packets::configuration::CustomPayload {
+                                    channel: "voicechat:set_group".into(),
+                                    data: payload,
+                                },
+                            ),
+                        );
+                    }
+                    Err(e) => log::info!("svc_voice: cannot join {name}: {e:?}"),
+                },
+                // Not yet: put it back and try again next frame.
+                None => crate::game::svc_voice::request_join(&name, password.as_deref()),
+            }
+        }
+    }
+
     if let Some(c) = crate::game::svc_voice::take_counters_change() {
         log::info!("svc_voice: {c}");
     }

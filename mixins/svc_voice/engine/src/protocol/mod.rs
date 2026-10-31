@@ -17,6 +17,7 @@
 //! | [`wire`] | VarInt, String, `byte[]`, UUID and fixed-width primitives |
 //! | [`crypto`] | AES-128-GCM with `IV‖ciphertext‖tag` framing |
 //! | [`framing`] | UDP datagram header (client and server direction) |
+//! | [`groups`] | group state and the `voicechat:*` group payloads (§8.5–§8.10) |
 //! | [`packets`] | the ten UDP packet types `0x01`…`0x0A` |
 //! | [`handshake`] | `voicechat:request_secret` / `voicechat:secret` payloads |
 //! | [`session`] | pure state machine: retries, keep-alives, timeout |
@@ -45,6 +46,7 @@
 
 pub mod crypto;
 pub mod framing;
+pub mod groups;
 pub mod handshake;
 pub mod jitter;
 pub mod packets;

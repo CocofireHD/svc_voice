@@ -84,6 +84,69 @@ pub fn entity_position(key: &[u8; 16]) -> Option<[f64; 3]> {
     POSITIONS.lock().unwrap().as_ref()?.get(key).copied()
 }
 
+// The server's group list and the group this client is in (§8.5, §8.10).
+static GROUPS: Mutex<Option<svc_engine::protocol::groups::Groups>> = Mutex::new(None);
+static GROUP_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// A join typed before the server had sent its group list: the tick retries it
+// as soon as the name shows up, instead of making the player type it again.
+static PENDING_JOIN: Mutex<Option<(String, Option<String>)>> = Mutex::new(None);
+
+fn with_groups<R>(f: impl FnOnce(&mut svc_engine::protocol::groups::Groups) -> R) -> R {
+    let mut slot = GROUPS.lock().unwrap();
+    let groups = slot.get_or_insert_with(Default::default);
+    f(groups)
+}
+
+pub fn groups_add(info: svc_engine::protocol::groups::GroupInfo) {
+    with_groups(|g| g.insert(info));
+}
+
+pub fn groups_remove(id: svc_engine::protocol::Uuid) {
+    with_groups(|g| g.remove(id));
+}
+
+pub fn groups_joined(id: Option<svc_engine::protocol::Uuid>) {
+    with_groups(|g| g.current = id);
+    clear_pending_join();
+}
+
+/// The group list as `/vc list` prints it.
+pub fn group_summary() -> String {
+    with_groups(|g| g.summary())
+}
+
+/// A group by name, for the join command.
+pub fn group_by_name(name: &str) -> Option<svc_engine::protocol::groups::GroupInfo> {
+    with_groups(|g| g.by_name(name).cloned())
+}
+
+/// The group this client is in, if any.
+pub fn current_group() -> Option<svc_engine::protocol::groups::GroupInfo> {
+    with_groups(|g| g.current_info().cloned())
+}
+
+/// `0x03` frames the session has seen, played or not.
+pub fn group_packets_seen() -> u64 {
+    GROUP_PACKETS.load(Ordering::Relaxed)
+}
+
+pub fn request_join(name: &str, password: Option<&str>) {
+    *PENDING_JOIN.lock().unwrap() = Some((name.to_string(), password.map(str::to_string)));
+}
+
+pub fn take_pending_join() -> Option<(String, Option<String>)> {
+    PENDING_JOIN.lock().unwrap().take()
+}
+
+pub fn clear_pending_join() {
+    *PENDING_JOIN.lock().unwrap() = None;
+}
+
+/// How many groups the server announced.
+pub fn known_groups() -> usize {
+    with_groups(|g| g.list.len())
+}
+
 /// A wall between listener and speaker, as the tick last measured it.
 pub fn set_occluded(key: [u8; 16], blocked: bool) {
     OCCLUSION
@@ -368,6 +431,40 @@ const MAX_ATTEMPTS: u32 = 5;
 /// `voicechat:secret` arrives on the plugin channel; decode and keep it.
 /// Returns true when the channel was ours, so the caller can stop looking.
 pub fn on_plugin_message(channel: &str, data: &[u8]) -> bool {
+    // §8.5–§8.10: the group list, its removals, and the answer to a join.
+    match channel {
+        "voicechat:add_group" => {
+            match svc_engine::protocol::groups::GroupInfo::parse(data) {
+                Ok(info) => {
+                    log::info!("svc_voice: group {} ({})", info.name, info.kind.name());
+                    groups_add(info);
+                }
+                Err(e) => log::warn!("svc_voice: bad add_group: {e:?}"),
+            }
+            return true;
+        }
+        "voicechat:remove_group" => {
+            if let Ok(id) = svc_engine::protocol::groups::parse_remove_group(data) {
+                groups_remove(id);
+            }
+            return true;
+        }
+        "voicechat:joined_group" => {
+            match svc_engine::protocol::groups::Joined::parse(data) {
+                Ok(j) => {
+                    if j.wrong_password {
+                        log::info!("svc_voice: group join refused, wrong password");
+                    } else {
+                        groups_joined(j.group);
+                        log::info!("svc_voice: groups now {}", group_summary());
+                    }
+                }
+                Err(e) => log::warn!("svc_voice: bad joined_group: {e:?}"),
+            }
+            return true;
+        }
+        _ => {}
+    }
     if channel != "voicechat:secret" {
         return false;
     }
@@ -551,8 +648,9 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     );
                     *STATE.lock().unwrap() = Some(format!("{:?}", client.state()));
                     let s = client.stats();
+                    GROUP_PACKETS.store(s.group_sound_frames, Ordering::Relaxed);
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} occ {} pos {} gate {} {}",
+                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} occ {} grp {} g03 {} groups {} pos {} gate {} {}",
                         s.auth_sent,
                         s.connection_check_sent,
                         s.mic_frames_sent,
@@ -562,6 +660,9 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         pipe.attenuated(),
                         pipe.panned(),
                         pipe.occluded(),
+                        pipe.group_frames(),
+                        group_packets_seen(),
+                        known_groups(),
                         known_speakers(),
                         gate_name_now(),
                         if ptt_held() { "ptt" } else { "" }
