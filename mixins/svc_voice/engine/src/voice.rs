@@ -106,6 +106,8 @@ pub struct PipelineConfig {
     pub threshold: f32,
     /// How long the gate stays open after the last loud frame.
     pub hangover: std::time::Duration,
+    /// Output volume, 0..2. 1.0 is untouched.
+    pub volume: f32,
 }
 
 impl Default for PipelineConfig {
@@ -116,6 +118,7 @@ impl Default for PipelineConfig {
             gate: Gate::Open,
             threshold: 0.012,
             hangover: std::time::Duration::from_millis(300),
+            volume: 1.0,
         }
     }
 }
@@ -295,6 +298,23 @@ impl VoicePipeline {
         }
     }
 
+    pub fn set_threshold(&mut self, threshold: f32) {
+        self.cfg.threshold = threshold.clamp(0.0, 1.0);
+    }
+
+    pub fn set_hangover(&mut self, hangover: std::time::Duration) {
+        self.cfg.hangover = hangover;
+    }
+
+    /// Output volume, 0..2; the config file's `volume`.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.cfg.volume = volume.clamp(0.0, 2.0);
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.cfg.volume
+    }
+
     pub fn gate(&self) -> Gate {
         self.cfg.gate
     }
@@ -401,6 +421,7 @@ impl VoicePipeline {
         muffled: bool,
         sink: &dyn SpeakerSink,
     ) -> usize {
+        let gain = gain * self.cfg.volume;
         let buffer = self
             .jitter
             .entry(sound.channel_id)

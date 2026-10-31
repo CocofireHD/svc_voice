@@ -99,6 +99,9 @@ pub fn is_occluded(key: &[u8; 16]) -> bool {
     if std::env::var_os("SVC_FORCE_OCCLUDED").is_some_and(|v| v == "1") {
         return true;
     }
+    if !config().occlusion {
+        return false;
+    }
     OCCLUSION
         .lock()
         .unwrap()
@@ -121,6 +124,126 @@ pub fn speakers() -> Vec<([u8; 16], [f64; 3])> {
 /// How many speakers the client currently knows a position for.
 pub fn known_speakers() -> usize {
     POSITIONS.lock().unwrap().as_ref().map_or(0, HashMap::len)
+}
+
+
+// The settings file the mod reads at session start: <game home>/svc_voice.txt,
+// or SVC_CONFIG. One "key = value" per line, "#" starts a comment. It is not
+// TOML on purpose: no parser, no dependency, and the bundle may not add one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    pub gate: String,
+    pub threshold: f32,
+    pub hangover_ms: u64,
+    pub volume: f32,
+    pub input_device: Option<String>,
+    pub output_device: Option<String>,
+    pub mute_key: String,
+    pub ptt_key: String,
+    pub gate_key: String,
+    pub occlusion: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            gate: "voice".into(),
+            threshold: 0.012,
+            hangover_ms: 300,
+            volume: 1.0,
+            input_device: None,
+            output_device: None,
+            mute_key: "M".into(),
+            ptt_key: "CapsLock".into(),
+            gate_key: "V".into(),
+            occlusion: true,
+        }
+    }
+}
+
+impl Config {
+    /// Parse the file's text. Unknown keys and unparsable values are kept out
+    /// of the result but never reject the whole file: a typo must not silence
+    /// a player's voice chat.
+    pub fn parse(text: &str) -> Self {
+        let mut cfg = Self::default();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+            match key.as_str() {
+                "gate" => cfg.gate = value.to_ascii_lowercase(),
+                "threshold" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        if (0.0..=1.0).contains(&v) {
+                            cfg.threshold = v;
+                        }
+                    }
+                }
+                "hangover_ms" => {
+                    if let Ok(v) = value.parse::<u64>() {
+                        cfg.hangover_ms = v.min(5_000);
+                    }
+                }
+                "volume" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        if (0.0..=2.0).contains(&v) {
+                            cfg.volume = v;
+                        }
+                    }
+                }
+                "input_device" if !value.is_empty() => cfg.input_device = Some(value.to_string()),
+                "output_device" if !value.is_empty() => cfg.output_device = Some(value.to_string()),
+                "mute_key" => cfg.mute_key = value.to_string(),
+                "ptt_key" => cfg.ptt_key = value.to_string(),
+                "gate_key" => cfg.gate_key = value.to_string(),
+                "occlusion" => {
+                    cfg.occlusion = !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "0"
+                    )
+                }
+                _ => {}
+            }
+        }
+        cfg
+    }
+
+    /// Read the file, falling back to the defaults when there is none.
+    pub fn load(path: &std::path::Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn gate_mode(&self) -> svc_engine::voice::Gate {
+        match self.gate.as_str() {
+            "always" | "always-on" | "open" => svc_engine::voice::Gate::Open,
+            "ptt" | "push-to-talk" => svc_engine::voice::Gate::PushToTalk,
+            _ => svc_engine::voice::Gate::VoiceActivity,
+        }
+    }
+}
+
+static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
+
+/// The settings, read once per process.
+pub fn config() -> Config {
+    let mut slot = CONFIG.lock().unwrap();
+    slot.get_or_insert_with(|| {
+        let path = std::env::var("SVC_CONFIG")
+            .map(std::path::PathBuf::from)
+            // The launcher starts the game with the game home as its working
+            // directory, so a relative name lands where players can find it.
+            .unwrap_or_else(|_| std::path::PathBuf::from("svc_voice.txt"));
+        let cfg = Config::load(&path);
+        eprintln!("[svc-voice] settings: {} ({cfg:?})", path.display());
+        cfg
+    })
+    .clone()
 }
 
 /// The push-to-talk key, as the tick sees it.
@@ -374,14 +497,27 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
 
                 // Device override for testing and for players with two sound
                 // cards: SVC_INPUT_DEVICE / SVC_OUTPUT_DEVICE, substring match.
-                let input = std::env::var("SVC_INPUT_DEVICE").ok();
-                let output = std::env::var("SVC_OUTPUT_DEVICE").ok();
+                let cfg = config();
+                let input = std::env::var("SVC_INPUT_DEVICE")
+                    .ok()
+                    .or_else(|| cfg.input_device.clone());
+                let output = std::env::var("SVC_OUTPUT_DEVICE")
+                    .ok()
+                    .or_else(|| cfg.output_device.clone());
                 let mut mic = svc_engine::audio::Capture::open(input.as_deref())
                     .map_err(|e| format!("microphone: {e}"))?;
                 let sink = svc_engine::audio::Playback::open(output.as_deref())
                     .map_err(|e| format!("output: {e}"))?;
-                // SVC_GATE picks the first mode: voice-activity (default),
-                // always-on, or push-to-talk.
+                // The file sets the start mode and the gate's numbers; the
+                // environment overrides it, which is what tests use.
+                GATE.store(
+                    match cfg.gate_mode() {
+                        svc_engine::voice::Gate::Open => 1,
+                        svc_engine::voice::Gate::PushToTalk => 2,
+                        svc_engine::voice::Gate::VoiceActivity => 0,
+                    },
+                    Ordering::Relaxed,
+                );
                 if let Ok(name) = std::env::var("SVC_GATE") {
                     GATE.store(
                         match name.as_str() {
@@ -392,6 +528,9 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         Ordering::Relaxed,
                     );
                 }
+                pipe.set_threshold(cfg.threshold);
+                pipe.set_hangover(std::time::Duration::from_millis(cfg.hangover_ms));
+                pipe.set_volume(cfg.volume);
                 while !STOP.load(Ordering::SeqCst) {
                     // The pipeline does not read the socket: the caller pumps,
                     // which is also what drives the session's timers.
@@ -552,6 +691,48 @@ mod tests {
         assert!((behind - std::f32::consts::PI).abs() < 1e-4, "{behind}");
         let right = angle_to_sound(eye, look, [5.0, 0.0, 0.0]);
         assert!((right - std::f32::consts::FRAC_PI_2).abs() < 1e-4, "{right}");
+    }
+
+    #[test]
+    fn a_missing_file_means_the_defaults() {
+        let cfg = Config::parse("");
+        assert_eq!(cfg.gate, "voice");
+        assert_eq!(cfg.threshold, 0.012);
+        assert_eq!(cfg.volume, 1.0);
+        assert_eq!(cfg.mute_key, "M");
+        assert!(cfg.occlusion);
+    }
+
+    #[test]
+    fn the_settings_file_sets_what_it_names() {
+        let cfg = Config::parse(
+            "# my settings\n\
+             gate = ptt\n\
+             threshold = 0.02   # quieter room\n\
+             hangover_ms = 500\n\
+             volume = 0.8\n\
+             input_device = CABLE Output\n\
+             mute_key = N\n\
+             occlusion = off\n",
+        );
+        assert_eq!(cfg.gate, "ptt");
+        assert_eq!(cfg.threshold, 0.02);
+        assert_eq!(cfg.hangover_ms, 500);
+        assert_eq!(cfg.volume, 0.8);
+        assert_eq!(cfg.input_device.as_deref(), Some("CABLE Output"));
+        assert_eq!(cfg.mute_key, "N");
+        assert!(!cfg.occlusion);
+        assert_eq!(cfg.ptt_key, "CapsLock", "untouched keys keep their default");
+    }
+
+    #[test]
+    fn a_typo_never_silences_the_voice_chat() {
+        // Nonsense values fall back to the default they would have replaced;
+        // the rest of the file still applies.
+        let cfg = Config::parse("threshold = loud\nvolume = 9\ngate = always\nnonsense = 1\n");
+        assert_eq!(cfg.threshold, 0.012);
+        assert_eq!(cfg.volume, 1.0, "out of range is ignored");
+        assert_eq!(cfg.gate, "always");
     }
 
     #[test]

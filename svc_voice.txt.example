@@ -1,0 +1,37 @@
+# svc_voice settings
+#
+# Put this file next to the game's options.txt, as svc_voice.txt, in the game
+# home directory (the launcher starts the game there). SVC_CONFIG=<path> reads
+# a different file. Every line is optional; a missing or unreadable file means
+# the defaults below, and a bad value is ignored rather than taking the rest of
+# the file with it. Restart the game after editing.
+
+# How the microphone opens:
+#   voice  - only while you speak (voice activity, the default)
+#   always - send continuously
+#   ptt    - only while the push-to-talk key is held
+gate = voice
+
+# Voice activity threshold, RMS over 20 ms, 0..1. Raise it in a noisy room.
+threshold = 0.012
+
+# How long the microphone stays open after the last loud frame, in ms.
+hangover_ms = 300
+
+# Output volume, 0..2. 1.0 leaves the audio untouched.
+volume = 1.0
+
+# Only the first device whose name contains this text is used, case sensitive.
+# Leave out to take the system default. Names as the operating system shows
+# them, e.g. input_device = Microphone (USB Audio)
+#input_device =
+#output_device =
+
+# Keys, as the game's own key names: single letters and digits, CapsLock, Tab,
+# Space, Shift, Ctrl, Alt, F1..F12.
+mute_key = M
+ptt_key = CapsLock
+gate_key = V
+
+# Muffle voices that have a wall between you and them.
+occlusion = on

@@ -122,6 +122,28 @@ Two things about the harness itself, worth knowing (both pre-existing, not cause
 - it disconnects about six seconds after joining, so a session test has to complete inside that
   window.
 
+## Settings
+
+There is no menu, so the settings live in a file: `svc_voice.txt` in the game home directory —
+the same place as `options.txt` — or wherever `SVC_CONFIG` points. `svc_voice.txt.example` lists
+every key with its default.
+
+| key | default | meaning |
+|---|---|---|
+| `gate` | `voice` | `voice`, `always` or `ptt` |
+| `threshold` | `0.012` | voice activity threshold, RMS over 20 ms |
+| `hangover_ms` | `300` | how long the microphone stays open after speech |
+| `volume` | `1.0` | output volume, 0..2 |
+| `input_device` | system default | first device whose name contains this text |
+| `output_device` | system default | same, for playback |
+| `mute_key` | `M` | microphone toggle |
+| `ptt_key` | `CapsLock` | push-to-talk |
+| `gate_key` | `V` | cycles the three modes |
+| `occlusion` | `on` | muffle voices behind walls |
+
+A bad value never takes the rest of the file with it: it is ignored and the default stands. The
+file is read once, at session start — restart the game after editing.
+
 ## Using it
 
 Join a server that runs Simple Voice Chat; the mod asks for the secret on its own and opens the

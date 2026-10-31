@@ -5,7 +5,84 @@
 // `Game` carries `player: Option<PlayerMotion>` (position), plus `yaw`, `pitch`
 // and `eye` (eye height); the look vector is the same one `view_vector` in
 // game.rs builds.
+
 fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
+    // The settings file, read once per process; the keys it names are mapped
+    // here because this module is the only place that knows winit's KeyCode.
+    static SETTINGS: std::sync::OnceLock<crate::game::svc_voice::Config> =
+        std::sync::OnceLock::new();
+    let settings = SETTINGS.get_or_init(crate::game::svc_voice::config);
+    let key_of = |name: &str| -> Option<KeyCode> {
+        let upper = name.trim().to_ascii_uppercase();
+        let mut chars = upper.chars();
+        let single = match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+        if let Some(c) = single {
+            return Some(match c {
+                'A' => KeyCode::KeyA,
+                'B' => KeyCode::KeyB,
+                'C' => KeyCode::KeyC,
+                'D' => KeyCode::KeyD,
+                'E' => KeyCode::KeyE,
+                'F' => KeyCode::KeyF,
+                'G' => KeyCode::KeyG,
+                'H' => KeyCode::KeyH,
+                'I' => KeyCode::KeyI,
+                'J' => KeyCode::KeyJ,
+                'K' => KeyCode::KeyK,
+                'L' => KeyCode::KeyL,
+                'M' => KeyCode::KeyM,
+                'N' => KeyCode::KeyN,
+                'O' => KeyCode::KeyO,
+                'P' => KeyCode::KeyP,
+                'Q' => KeyCode::KeyQ,
+                'R' => KeyCode::KeyR,
+                'S' => KeyCode::KeyS,
+                'T' => KeyCode::KeyT,
+                'U' => KeyCode::KeyU,
+                'V' => KeyCode::KeyV,
+                'W' => KeyCode::KeyW,
+                'X' => KeyCode::KeyX,
+                'Y' => KeyCode::KeyY,
+                'Z' => KeyCode::KeyZ,
+                '0' => KeyCode::Digit0,
+                '1' => KeyCode::Digit1,
+                '2' => KeyCode::Digit2,
+                '3' => KeyCode::Digit3,
+                '4' => KeyCode::Digit4,
+                '5' => KeyCode::Digit5,
+                '6' => KeyCode::Digit6,
+                '7' => KeyCode::Digit7,
+                '8' => KeyCode::Digit8,
+                '9' => KeyCode::Digit9,
+                _ => return None,
+            });
+        }
+        Some(match upper.as_str() {
+            "CAPSLOCK" => KeyCode::CapsLock,
+            "TAB" => KeyCode::Tab,
+            "SPACE" => KeyCode::Space,
+            "SHIFT" | "LEFTSHIFT" => KeyCode::ShiftLeft,
+            "CTRL" | "CONTROL" | "LEFTCONTROL" => KeyCode::ControlLeft,
+            "ALT" | "LEFTALT" => KeyCode::AltLeft,
+            "F1" => KeyCode::F1,
+            "F2" => KeyCode::F2,
+            "F3" => KeyCode::F3,
+            "F4" => KeyCode::F4,
+            "F5" => KeyCode::F5,
+            "F6" => KeyCode::F6,
+            "F7" => KeyCode::F7,
+            "F8" => KeyCode::F8,
+            "F9" => KeyCode::F9,
+            "F10" => KeyCode::F10,
+            "F11" => KeyCode::F11,
+            "F12" => KeyCode::F12,
+            _ => return None,
+        })
+    };
+
     if let Some(p) = &game.player {
         let (yaw, pitch) = (
             f64::from(game.yaw).to_radians(),
@@ -62,7 +139,10 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
 
     // M toggles the microphone (§8.1). Edge-detected, so holding the key sends
     // one message per press; the payload is a single byte, 1 = disabled.
-    let pressed = game.player.is_some() && game.remote.is_some() && game.keys.contains(&KeyCode::KeyM);
+    let mute_key = key_of(&settings.mute_key).unwrap_or(KeyCode::KeyM);
+    let ptt_key = key_of(&settings.ptt_key).unwrap_or(KeyCode::CapsLock);
+    let gate_key = key_of(&settings.gate_key).unwrap_or(KeyCode::KeyV);
+    let pressed = game.player.is_some() && game.remote.is_some() && game.keys.contains(&mute_key);
     if crate::game::svc_voice::mute_key_edge(pressed) {
         let disabled = crate::game::svc_voice::toggle_mute();
         log::info!("svc_voice: muted {disabled}");
@@ -76,8 +156,8 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
 
     // CapsLock is push-to-talk; V cycles voice activity, always-on and PTT.
     let in_game = game.player.is_some() && game.remote.is_some();
-    crate::game::svc_voice::set_ptt(in_game && game.keys.contains(&KeyCode::CapsLock));
-    if let Some(mode) = crate::game::svc_voice::cycle_gate(in_game && game.keys.contains(&KeyCode::KeyV)) {
+    crate::game::svc_voice::set_ptt(in_game && game.keys.contains(&ptt_key));
+    if let Some(mode) = crate::game::svc_voice::cycle_gate(in_game && game.keys.contains(&gate_key)) {
         log::info!("svc_voice: gate {mode}");
     }
 
