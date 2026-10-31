@@ -7,8 +7,8 @@ This folder is the Simple Voice Chat client packaged the way Horizon's market ta
 python tools/package.py     # -> target/svc_voice-0.1.0.hnmod
 ```
 
-Current artefact: `target/svc_voice-0.1.0.hnmod`, 361 604 bytes, 91 entries,
-sha256 `843bb65a0892ff8779d3f8f300e8ae7f68520d2aabc16dad34cf1e522d750fe4`.
+Current artefact: `target/svc_voice-0.1.0.hnmod`, 368 249 bytes, 92 entries,
+sha256 `6f8729f72fa16f913a1fd29f1fefca7cebd725355ba0733f4e3d881b0ac140c2`.
 Built from a clean clone of this repository, so the hash is reproducible: LF endings, same files,
 same order.
 
