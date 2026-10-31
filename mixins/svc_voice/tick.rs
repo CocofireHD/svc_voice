@@ -24,6 +24,27 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
             ],
         );
     }
+    // A wall between the eyes and a speaker muffles the voice. The voice
+    // thread cannot read the world, so the sight test runs here and only its
+    // verdict is published.
+    if let Some(p) = &game.player {
+        let eye = [
+            p.position.x,
+            p.position.y + f64::from(game.eye),
+            p.position.z,
+        ];
+        for (key, at) in crate::game::svc_voice::speakers() {
+            let d = [at[0] - eye[0], at[1] - eye[1], at[2] - eye[2]];
+            let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let blocked = if distance < 0.5 {
+                false
+            } else {
+                let dir = [d[0] / distance, d[1] / distance, d[2] / distance];
+                game.clip_ray(eye, dir, distance).is_some()
+            };
+            crate::game::svc_voice::set_occluded(key, blocked);
+        }
+    }
     crate::game::svc_voice::on_tick();
 
     // Ask the server for the voice secret once we are on a server. The reply

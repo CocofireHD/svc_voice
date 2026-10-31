@@ -39,6 +39,7 @@ fn from_milli(v: i64) -> f64 {
 // `Uuid::as_bytes` returns, without needing the uuid crate here.
 static ENTITY_IDS: Mutex<Option<HashMap<i32, [u8; 16]>>> = Mutex::new(None);
 static POSITIONS: Mutex<Option<HashMap<[u8; 16], [f64; 3]>>> = Mutex::new(None);
+static OCCLUSION: Mutex<Option<HashMap<[u8; 16], bool>>> = Mutex::new(None);
 
 /// The 16 bytes of a protocol UUID, high half first — the same order as the
 /// `u128` in `AddEntity`.
@@ -81,6 +82,40 @@ pub fn remove_entity(key: [u8; 16]) {
 
 pub fn entity_position(key: &[u8; 16]) -> Option<[f64; 3]> {
     POSITIONS.lock().unwrap().as_ref()?.get(key).copied()
+}
+
+/// A wall between listener and speaker, as the tick last measured it.
+pub fn set_occluded(key: [u8; 16], blocked: bool) {
+    OCCLUSION
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, blocked);
+}
+
+pub fn is_occluded(key: &[u8; 16]) -> bool {
+    // SVC_FORCE_OCCLUDED=1 mutes the sight test, so the muffling path can be
+    // exercised where there is nothing to hide behind.
+    if std::env::var_os("SVC_FORCE_OCCLUDED").is_some_and(|v| v == "1") {
+        return true;
+    }
+    OCCLUSION
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(key))
+        .copied()
+        .unwrap_or(false)
+}
+
+/// The speakers we know a position for, for the tick's line-of-sight test.
+pub fn speakers() -> Vec<([u8; 16], [f64; 3])> {
+    POSITIONS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
+        .unwrap_or_default()
 }
 
 /// How many speakers the client currently knows a position for.
@@ -373,11 +408,12 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         listener_eye(),
                         listener_look(),
                         |u| entity_position(&uuid_key(&u)),
+                        |u| is_occluded(&uuid_key(&u)),
                     );
                     *STATE.lock().unwrap() = Some(format!("{:?}", client.state()));
                     let s = client.stats();
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} pos {} gate {} {}",
+                        "auth {} cc {} mic {} skip {} lvl {} snd {} att {} pan {} occ {} pos {} gate {} {}",
                         s.auth_sent,
                         s.connection_check_sent,
                         s.mic_frames_sent,
@@ -386,6 +422,7 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                         s.sound_frames,
                         pipe.attenuated(),
                         pipe.panned(),
+                        pipe.occluded(),
                         known_speakers(),
                         gate_name_now(),
                         if ptt_held() { "ptt" } else { "" }

@@ -187,6 +187,20 @@ pub fn pan_gains(listener: [f64; 3], look: [f64; 3], sound: [f64; 3]) -> (f32, f
     (angle.cos(), angle.sin())
 }
 
+/// One-pole low-pass at about 800 Hz for 48 kHz PCM: what a wall does to a
+/// voice. The state carries between frames so there is no click at the seam.
+pub fn lowpass(pcm: &mut [f32], state: &mut f32) {
+    // a = 1 - exp(-2*pi*fc/fs), with fc = 800, fs = 48000.
+    const A: f32 = 0.0996;
+    for s in pcm.iter_mut() {
+        *state += A * (*s - *state);
+        *s = *state;
+    }
+}
+
+/// How much a wall takes off a voice, on top of the low-pass.
+pub const OCCLUDED_GAIN: f32 = 0.55;
+
 /// Play one decoded frame at `gain`, panned if the caller knows where the
 /// speaker is, mono otherwise.
 fn play(pcm: &[f32], gain: f32, pan: Option<(f32, f32)>, sink: &dyn SpeakerSink) {
@@ -228,6 +242,10 @@ pub struct VoicePipeline {
     attenuated: u64,
     /// Sounds that were panned away from the centre: proves the stereo path ran.
     panned: u64,
+    /// Sounds muffled by a wall.
+    occluded: u64,
+    /// Low-pass state, carried between frames.
+    lp: f32,
     /// Whether the last frame we sent opened the stream (for the stop packet).
     sending: bool,
     /// Last frame that passed the threshold, for the hangover.
@@ -249,6 +267,8 @@ impl VoicePipeline {
             inbox: None,
             attenuated: 0,
             panned: 0,
+            occluded: 0,
+            lp: 0.0,
             sending: false,
             last_loud: None,
             ptt: false,
@@ -282,6 +302,11 @@ impl VoicePipeline {
     /// The push-to-talk key, as last published by the game thread.
     pub fn set_ptt(&mut self, held: bool) {
         self.ptt = held;
+    }
+
+    /// Sounds played through the wall filter.
+    pub fn occluded(&self) -> u64 {
+        self.occluded
     }
 
     /// Sounds delivered off-centre, left and right differing.
@@ -362,7 +387,7 @@ impl VoicePipeline {
     /// Feed one relayed sound packet through the jitter buffer and play what
     /// became ready. Returns the number of frames queued for playback.
     pub fn deliver(&mut self, now: Instant, sound: &SoundFrame, sink: &dyn SpeakerSink) -> usize {
-        self.deliver_with_gain(now, sound, 1.0, None, sink)
+        self.deliver_with_gain(now, sound, 1.0, None, false, sink)
     }
 
     /// Same, with a distance gain from [`distance_gain`] applied to every decoded
@@ -373,6 +398,7 @@ impl VoicePipeline {
         sound: &SoundFrame,
         gain: f32,
         pan: Option<(f32, f32)>,
+        muffled: bool,
         sink: &dyn SpeakerSink,
     ) -> usize {
         let buffer = self
@@ -397,6 +423,9 @@ impl VoicePipeline {
             for _ in 0..delivery.lost {
                 match self.decoder.decode(None) {
                     Ok(mut pcm) => {
+                        if muffled {
+                            lowpass(&mut pcm, &mut self.lp);
+                        }
                         play(&pcm, gain, pan, sink);
                         self.stats.concealed += 1;
                         self.stats.played += 1;
@@ -410,6 +439,9 @@ impl VoicePipeline {
             }
             match self.decoder.decode(Some(&delivery.data)) {
                 Ok(mut pcm) => {
+                    if muffled {
+                        lowpass(&mut pcm, &mut self.lp);
+                    }
                     play(&pcm, gain, pan, sink);
                     self.stats.played += 1;
                     played += 1;
@@ -451,7 +483,7 @@ impl VoicePipeline {
     /// packet only carries the sender's UUID; `position_of` maps that to a
     /// world position. A speaker we cannot place is played at full volume
     /// rather than dropped — silence would be a worse guess.
-    pub fn tick_positional<F>(
+    pub fn tick_positional<F, O>(
         &mut self,
         now: Instant,
         client: &mut ClientSession,
@@ -460,9 +492,11 @@ impl VoicePipeline {
         listener: [f64; 3],
         look: [f64; 3],
         position_of: F,
+        occluded_of: O,
     ) -> usize
     where
         F: Fn(Uuid) -> Option<[f64; 3]>,
+        O: Fn(Uuid) -> bool,
     {
         let mut played = 0;
         let events: Vec<Incoming> = match self.inbox.as_ref() {
@@ -493,10 +527,15 @@ impl VoicePipeline {
                     self.panned += 1;
                 }
             }
+            let muffled = occluded_of(sound.sender);
+            let gain = if muffled { gain * OCCLUDED_GAIN } else { gain };
             if gain < 0.999 {
                 self.attenuated += 1;
             }
-            played += self.deliver_with_gain(now, &sound, gain, pan, sink);
+            if muffled {
+                self.occluded += 1;
+            }
+            played += self.deliver_with_gain(now, &sound, gain, pan, muffled, sink);
         }
         self.capture(mic, client);
         played
@@ -519,6 +558,26 @@ mod tests {
         fn drain(&mut self) -> Vec<Vec<f32>> {
             std::mem::take(&mut self.frames)
         }
+    }
+
+    #[test]
+    fn the_wall_filter_keeps_low_tones_and_loses_high_ones() {
+        let rate = 48_000.0f32;
+        let run = |freq: f32| {
+            let mut pcm: Vec<f32> = (0..9600)
+                .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / rate).sin())
+                .collect();
+            let mut state = 0.0;
+            lowpass(&mut pcm, &mut state);
+            // Skip the first 100 ms: the filter settles there.
+            let tail = &pcm[4800..];
+            (tail.iter().map(|s| s * s).sum::<f32>() / tail.len() as f32).sqrt()
+        };
+        let low = run(100.0);
+        let high = run(4000.0);
+        assert!(low > 0.6, "a 100 Hz tone passes: {low}");
+        assert!(low > high * 3.0, "a 4 kHz tone is muffled: low {low}, high {high}");
+        assert!(OCCLUDED_GAIN < 1.0);
     }
 
     #[test]
@@ -767,7 +826,7 @@ mod tests {
             let mut q = VoicePipeline::new(PipelineConfig::default()).unwrap();
             let s2 = TestSink::default();
             let frame = sound(&mut q, 0, 1);
-            q.deliver_with_gain(now, &frame, 0.25, None, &s2);
+            q.deliver_with_gain(now, &frame, 0.25, None, false, &s2);
             crate::audio::rms(&s2.flat())
         };
         assert!(quiet < full * 0.5, "quiet {quiet:.3} vs full {full:.3}");
