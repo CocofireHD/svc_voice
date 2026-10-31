@@ -1,12 +1,41 @@
 // Runs at the head of the client's serverbound-packet handler, where every
 // serverbound/plugin message the server sends is decoded. Only the voice chat
-// channels are touched; everything else falls through to the game unchanged.
+// channels and the entity bookkeeping for positional audio are touched;
+// everything else falls through to the game unchanged.
 fn svc_voice_packet(
     game: &mut crate::game::Game<'_>,
     packet: &horizon_protocol::packets::play::Clientbound,
 ) {
+    use horizon_protocol::packets::play::Clientbound as C;
     let _ = game;
-    if let horizon_protocol::packets::play::Clientbound::CustomPayload(p) = packet {
-        crate::game::svc_voice::on_plugin_message(&p.channel, &p.data);
+    match packet {
+        C::CustomPayload(p) => {
+            crate::game::svc_voice::on_plugin_message(&p.channel, &p.data);
+        }
+        // §7.4: the speaker's position comes from the entity, keyed by the UUID
+        // the voice packet carries. `AddEntity` is where the two meet.
+        C::AddEntity(p) => {
+            let key = p.uuid.to_be_bytes();
+            crate::game::svc_voice::map_entity(p.id, key);
+            crate::game::svc_voice::set_entity(key, p.position);
+        }
+        C::TeleportEntity(p) => {
+            if let Some(key) = crate::game::svc_voice::entity_key(p.id) {
+                crate::game::svc_voice::set_entity(key, p.position);
+            }
+        }
+        C::EntityPositionSync(p) => {
+            if let Some(key) = crate::game::svc_voice::entity_key(p.id) {
+                crate::game::svc_voice::set_entity(key, p.path.end());
+            }
+        }
+        C::RemoveEntities(p) => {
+            for id in &p.ids {
+                if let Some(key) = crate::game::svc_voice::forget_entity(*id) {
+                    crate::game::svc_voice::remove_entity(key);
+                }
+            }
+        }
+        _ => {}
     }
 }

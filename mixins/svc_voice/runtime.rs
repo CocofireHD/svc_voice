@@ -10,6 +10,7 @@
 // codec crate and a bundle may not add one.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// The engine is a real dependency, not a placeholder: this is its frame size,
@@ -29,6 +30,62 @@ fn to_milli(v: f64) -> i64 {
 
 fn from_milli(v: i64) -> f64 {
     v as f64 / 1000.0
+}
+
+// Player positions, for distance attenuation (§7.4). The voice packet names
+// the speaker by UUID and the world names entities by id, so both directions
+// are kept: id -> UUID from `AddEntity`, UUID -> position from the movement
+// packets. Keyed by the UUID's 16 big-endian bytes, which is what
+// `Uuid::as_bytes` returns, without needing the uuid crate here.
+static ENTITY_IDS: Mutex<Option<HashMap<i32, [u8; 16]>>> = Mutex::new(None);
+static POSITIONS: Mutex<Option<HashMap<[u8; 16], [f64; 3]>>> = Mutex::new(None);
+
+/// The 16 bytes of a protocol UUID, high half first — the same order as the
+/// `u128` in `AddEntity`.
+fn uuid_key(u: &svc_engine::protocol::Uuid) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key[..8].copy_from_slice(&u.msb.to_be_bytes());
+    key[8..].copy_from_slice(&u.lsb.to_be_bytes());
+    key
+}
+
+pub fn map_entity(id: i32, key: [u8; 16]) {
+    ENTITY_IDS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(id, key);
+}
+
+pub fn entity_key(id: i32) -> Option<[u8; 16]> {
+    ENTITY_IDS.lock().unwrap().as_ref()?.get(&id).copied()
+}
+
+pub fn forget_entity(id: i32) -> Option<[u8; 16]> {
+    ENTITY_IDS.lock().unwrap().as_mut()?.remove(&id)
+}
+
+pub fn set_entity(key: [u8; 16], position: [f64; 3]) {
+    POSITIONS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, position);
+}
+
+pub fn remove_entity(key: [u8; 16]) {
+    if let Some(map) = POSITIONS.lock().unwrap().as_mut() {
+        map.remove(&key);
+    }
+}
+
+pub fn entity_position(key: &[u8; 16]) -> Option<[f64; 3]> {
+    POSITIONS.lock().unwrap().as_ref()?.get(key).copied()
+}
+
+/// How many speakers the client currently knows a position for.
+pub fn known_speakers() -> usize {
+    POSITIONS.lock().unwrap().as_ref().map_or(0, HashMap::len)
 }
 
 /// Publish where the listener is and where it looks. Called from the tick
@@ -198,12 +255,24 @@ pub fn ensure_started(mc_address: &str) -> Option<String> {
                     if let Err(e) = client.pump() {
                         return Err(format!("pump: {e}"));
                     }
-                    pipe.tick(std::time::Instant::now(), &mut client, &mut mic, &sink);
+                    pipe.tick_positional(
+                        std::time::Instant::now(),
+                        &mut client,
+                        &mut mic,
+                        &sink,
+                        listener_eye(),
+                        |u| entity_position(&uuid_key(&u)),
+                    );
                     *STATE.lock().unwrap() = Some(format!("{:?}", client.state()));
                     let s = client.stats();
                     *COUNTERS.lock().unwrap() = Some(format!(
-                        "auth {} cc {} mic {} snd {}",
-                        s.auth_sent, s.connection_check_sent, s.mic_frames_sent, s.sound_frames
+                        "auth {} cc {} mic {} snd {} att {} pos {}",
+                        s.auth_sent,
+                        s.connection_check_sent,
+                        s.mic_frames_sent,
+                        s.sound_frames,
+                        pipe.attenuated(),
+                        known_speakers()
                     ));
                     if client.needs_secret() {
                         return Err("server asked for a new secret".into());

@@ -117,6 +117,8 @@ pub struct VoicePipeline {
     /// Taken from the session once, because `ClientSession::take_inbox` hands the
     /// receiver out permanently.
     inbox: Option<std::sync::mpsc::Receiver<Incoming>>,
+    /// Sounds played quieter than full volume: proves the distance curve ran.
+    attenuated: u64,
 }
 
 impl VoicePipeline {
@@ -128,6 +130,7 @@ impl VoicePipeline {
             cfg,
             stats: Stats::default(),
             inbox: None,
+            attenuated: 0,
         })
     }
 
@@ -139,6 +142,11 @@ impl VoicePipeline {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Sounds delivered with a distance gain below 1.0 (§7.4).
+    pub fn attenuated(&self) -> u64 {
+        self.attenuated
     }
 
     pub fn config(&self) -> &PipelineConfig {
@@ -257,6 +265,55 @@ impl VoicePipeline {
             if let Incoming::Sound(sound) = event {
                 played += self.deliver(now, &sound, sink);
             }
+        }
+        self.capture(mic, client);
+        played
+    }
+
+    /// `tick`, but each sound is attenuated by the speaker's distance from
+    /// `listener` (§7.4). Positions come from the caller because the voice
+    /// packet only carries the sender's UUID; `position_of` maps that to a
+    /// world position. A speaker we cannot place is played at full volume
+    /// rather than dropped — silence would be a worse guess.
+    pub fn tick_positional<F>(
+        &mut self,
+        now: Instant,
+        client: &mut ClientSession,
+        mic: &mut dyn MicSource,
+        sink: &dyn SpeakerSink,
+        listener: [f64; 3],
+        position_of: F,
+    ) -> usize
+    where
+        F: Fn(Uuid) -> Option<[f64; 3]>,
+    {
+        let mut played = 0;
+        let events: Vec<Incoming> = match self.inbox.as_ref() {
+            Some(rx) => rx.try_iter().collect(),
+            None => Vec::new(),
+        };
+        for event in events {
+            let Incoming::Sound(sound) = event else {
+                continue;
+            };
+            // §5.3: group audio is not positional.
+            if sound.group {
+                played += self.deliver(now, &sound, sink);
+                continue;
+            }
+            let speaker = sound.position.or_else(|| position_of(sound.sender));
+            let gain = match speaker {
+                Some(at) => match distance_gain(listener, at, sound.distance) {
+                    Some(gain) => gain,
+                    // §7.4: beyond the radius this client plays nothing.
+                    None => continue,
+                },
+                None => 1.0,
+            };
+            if gain < 0.999 {
+                self.attenuated += 1;
+            }
+            played += self.deliver_with_gain(now, &sound, gain, sink);
         }
         self.capture(mic, client);
         played

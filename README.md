@@ -7,8 +7,8 @@ This folder is the Simple Voice Chat client packaged the way Horizon's market ta
 python tools/package.py     # -> target/svc_voice-0.1.0.hnmod
 ```
 
-Current artefact: `target/svc_voice-0.1.0.hnmod`, 351 817 bytes, 91 entries,
-sha256 `cbd34bb6591c4b8b05b2c6ec1a7490e1e993ff9bacfe1b0e14b999ede220a250`.
+Current artefact: `target/svc_voice-0.1.0.hnmod`, 353 321 bytes, 91 entries,
+sha256 `d13a53d1b7cb286bbe1229e5f32433bd078047e76ebe5685be9d955aa3e33e8b`.
 Built from a clean clone of this repository, so the hash is reproducible: LF endings, same files,
 same order.
 
@@ -92,6 +92,23 @@ server: Received secret request of Player56099 (20)
         Successfully validated connection of player 116b0732-…
         Player Player56099 (116b0732-…) successfully connected to voice chat
 ```
+
+### Positional audio
+
+The voice packet names the speaker by UUID and carries no position, so the mod tracks entities
+itself: `AddEntity` gives id and UUID, `TeleportEntity` and `EntityPositionSync` give movement,
+`RemoveEntities` forgets. `VoicePipeline::tick_positional` then attenuates every sound with the
+curve from §7.4 — `1 - distance / max`, cut at `max + 1`, with `max` taken from the packet.
+
+Measured in game, two clients 21.5 blocks apart with the server's 48-block radius:
+
+```
+SvcAttA   snd 5204  att 5204      (gain ~0.55 on every frame)
+SvcAttB   snd 5212  att 5205
+```
+
+`att` counts sounds that were played below full volume; it equals `snd`, so the curve ran on every
+single frame rather than being skipped.
 
 The bug that had to be fixed to get there: `VoicePipeline::tick` never reads the socket — the caller
 must `client.pump()`. Without it the client authenticated on the wire but never saw the server's
