@@ -157,7 +157,11 @@ static SECRET: Mutex<Option<SecretInfo>> = Mutex::new(None);
 // The full payload as sent: `ClientSession::connect` is armed from it.
 static PAYLOAD: Mutex<Option<svc_engine::protocol::handshake::SecretPayload>> = Mutex::new(None);
 static SECRET_ERROR: Mutex<Option<String>> = Mutex::new(None);
-static REQUESTED: AtomicBool = AtomicBool::new(false);
+static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static LAST_REQUEST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+/// One per three seconds while the server says nothing; a server without the
+/// plugin then hears five packets, not an endless stream.
+const MAX_ATTEMPTS: u32 = 5;
 
 /// `voicechat:secret` arrives on the plugin channel; decode and keep it.
 /// Returns true when the channel was ours, so the caller can stop looking.
@@ -184,10 +188,25 @@ pub fn on_plugin_message(channel: &str, data: &[u8]) -> bool {
 }
 
 /// The bytes to send on `voicechat:request_secret`, once.
+/// The secret request, retried a few times before giving up. One shot is not
+/// enough: the first frame with a connection can be before the server accepts
+/// play packets, and a dropped request used to leave the voice session dead
+/// for the whole login (seen in a run where two clients joined at once).
 pub fn take_secret_request() -> Option<Vec<u8>> {
-    if REQUESTED.swap(true, Ordering::Relaxed) {
+    if PAYLOAD.lock().unwrap().is_some() || ATTEMPTS.load(Ordering::Relaxed) >= MAX_ATTEMPTS {
         return None;
     }
+    let now = std::time::Instant::now();
+    {
+        let mut last = LAST_REQUEST.lock().unwrap();
+        if let Some(at) = *last {
+            if now.duration_since(at) < std::time::Duration::from_secs(3) {
+                return None;
+            }
+        }
+        *last = Some(now);
+    }
+    ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     Some(svc_engine::protocol::handshake::RequestSecret::new().encode())
 }
 
@@ -203,7 +222,8 @@ pub fn secret_error() -> Option<String> {
 pub fn reset_session() {
     *SECRET.lock().unwrap() = None;
     *PAYLOAD.lock().unwrap() = None;
-    REQUESTED.store(false, Ordering::Relaxed);
+    ATTEMPTS.store(0, Ordering::Relaxed);
+    *LAST_REQUEST.lock().unwrap() = None;
     stop();
 }
 
