@@ -56,5 +56,5 @@ without the plugin it does nothing at all.
 ## sha256
 
 ```
-aa49e2d3620cdb9455b508007fc5b4ed37e43b5afe1ba4dad7fd0aa483b4401b
+6e5cb06d86686da12c8c1be38cf631db798a0a4fdacafbcdde409600c629b10d
 ```
