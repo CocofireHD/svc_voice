@@ -88,6 +88,27 @@ pub fn known_speakers() -> usize {
     POSITIONS.lock().unwrap().as_ref().map_or(0, HashMap::len)
 }
 
+/// True on the frame the key goes down, once per press.
+pub fn mute_key_edge(held: bool) -> bool {
+    if held {
+        !MUTE_HELD.swap(true, Ordering::Relaxed)
+    } else {
+        MUTE_HELD.store(false, Ordering::Relaxed);
+        false
+    }
+}
+
+/// Flip the microphone and report the new state: `true` means disabled.
+pub fn toggle_mute() -> bool {
+    let now = !MUTED.load(Ordering::Relaxed);
+    MUTED.store(now, Ordering::Relaxed);
+    now
+}
+
+pub fn is_muted() -> bool {
+    MUTED.load(Ordering::Relaxed)
+}
+
 /// Publish where the listener is and where it looks. Called from the tick
 /// inject; cheap enough for every frame.
 pub fn set_listener(eye: [f64; 3], look: [f64; 3]) {
@@ -193,6 +214,9 @@ static STOP: AtomicBool = AtomicBool::new(false);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static STATE: Mutex<Option<String>> = Mutex::new(None);
 static COUNTERS: Mutex<Option<String>> = Mutex::new(None);
+// §8.1: the microphone switch, and the key edge that flips it.
+static MUTED: AtomicBool = AtomicBool::new(false);
+static MUTE_HELD: AtomicBool = AtomicBool::new(false);
 // Backoff: a session that dies must not be retried every frame.
 static LAST_ATTEMPT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
@@ -357,6 +381,24 @@ pub fn angle_to_sound(eye: [f64; 3], look: [f64; 3], sound: [f64; 3]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mute_key_fires_once_per_press() {
+        assert!(mute_key_edge(true));
+        assert!(!mute_key_edge(true));
+        assert!(!mute_key_edge(false));
+        assert!(mute_key_edge(true));
+        assert!(!mute_key_edge(false));
+    }
+
+    #[test]
+    fn toggling_mute_flips_the_byte_the_server_gets() {
+        let before = is_muted();
+        assert_eq!(toggle_mute(), !before);
+        assert_eq!(is_muted(), !before);
+        assert_eq!(toggle_mute(), before);
+        assert_eq!(is_muted(), before);
+    }
 
     #[test]
     fn the_published_position_round_trips() {

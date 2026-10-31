@@ -39,6 +39,20 @@ fn svc_voice_tick(game: &mut crate::game::Game<'_>) {
         }
     }
 
+    // M toggles the microphone (§8.1). Edge-detected, so holding the key sends
+    // one message per press; the payload is a single byte, 1 = disabled.
+    let pressed = game.player.is_some() && game.remote.is_some() && game.keys.contains(&KeyCode::KeyM);
+    if crate::game::svc_voice::mute_key_edge(pressed) {
+        let disabled = crate::game::svc_voice::toggle_mute();
+        log::info!("svc_voice: muted {disabled}");
+        game.send(horizon_protocol::packets::play::Serverbound::CustomPayload(
+            horizon_protocol::packets::configuration::CustomPayload {
+                channel: "voicechat:update_state".into(),
+                data: vec![u8::from(disabled)],
+            },
+        ));
+    }
+
     if let Some(c) = crate::game::svc_voice::take_counters_change() {
         log::info!("svc_voice: {c}");
     }
